@@ -1,0 +1,45 @@
+{
+  "title": "BOSS直聘",
+  "url": "https://www.zhipin.com/web/chat/index",
+  "activeFilter": "未读",
+  "filterTabs": [
+    {
+      "label": "全部",
+      "active": false
+    },
+    {
+      "label": "未读",
+      "active": true
+    }
+  ],
+  "count": 3,
+  "conversations": [
+    {
+      "dataId": "744493973-0",
+      "unreadCount": "2",
+      "time": "11:34",
+      "candidateName": "华嫣",
+      "jobTitle": "线上分销（美妆）",
+      "summary": "我可以把我的简历发给您看看吗？",
+      "selected": false
+    },
+    {
+      "dataId": "57564321-0",
+      "unreadCount": "1",
+      "time": "11:34",
+      "candidateName": "马庆成",
+      "jobTitle": "天猫运营店长",
+      "summary": "居家日用，饰品，医疗器械大健康，水果都做过",
+      "selected": false
+    },
+    {
+      "dataId": "5682470-0",
+      "unreadCount": "2",
+      "time": "11:32",
+      "candidateName": "兰先生",
+      "jobTitle": "电商运营经理",
+      "summary": "对方想发送附件简历给您，您是否同意",
+      "selected": false
+    }
+  ]
+}

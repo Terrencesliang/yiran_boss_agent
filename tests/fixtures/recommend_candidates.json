@@ -1,0 +1,31 @@
+{
+  "title": "BOSS直聘",
+  "url": "https://www.zhipin.com/web/boss/recommend",
+  "count": 2,
+  "candidates": [
+    {
+      "candidateName": "周女士",
+      "expectedTitle": "期望：电商运营经理",
+      "expectedCity": "深圳",
+      "experience": "6年电商运营经验",
+      "education": "本科",
+      "tags": ["天猫", "京东", "美妆", "团队管理"],
+      "activeStatus": "今日活跃",
+      "detailTextPreview": "周女士 期望电商运营经理 深圳 6年电商运营经验 本科 天猫 京东 美妆 团队管理",
+      "cardIndex": 0,
+      "candidateId": "geek-001"
+    },
+    {
+      "candidateName": "李先生",
+      "expectedTitle": "期望：直播运营",
+      "expectedCity": "广州",
+      "experience": "1年直播经验",
+      "education": "大专",
+      "tags": ["直播", "主播"],
+      "activeStatus": "本周活跃",
+      "detailTextPreview": "李先生 期望直播运营 广州 1年直播经验 大专",
+      "cardIndex": 1,
+      "candidateId": "geek-002"
+    }
+  ]
+}

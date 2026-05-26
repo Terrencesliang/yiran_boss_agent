@@ -1,0 +1,18 @@
+{
+  "title": "BOSS直聘",
+  "url": "https://www.zhipin.com/web/geek/chat?id=mock",
+  "candidateName": "徐先生",
+  "company": "欧琳集团有限公司",
+  "role": "招聘专员",
+  "jobTitle": "AI 产品落地经理",
+  "salary": "20-30K",
+  "city": "深圳",
+  "messages": [
+    {
+      "direction": "outbound",
+      "time": "10:29",
+      "status": "送达",
+      "text": "占用您百忙之中的一点时间，关注贵公司很久了，和我的职业规划很吻合，想和您聊聊"
+    }
+  ]
+}

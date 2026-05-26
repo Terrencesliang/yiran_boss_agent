@@ -1,0 +1,14 @@
+{
+  "endpoint": "http://127.0.0.1:9222",
+  "urlContains": "/web/chat/recommend",
+  "jobTitle": "天猫运营",
+  "filters": {
+    "学历": "本科",
+    "年龄": "24-35",
+    "薪资待遇[单选]": "10-20k"
+  },
+  "criteria": "有2年天猫或淘宝美妆运营经验",
+  "targetResumes": 30,
+  "maxGreetings": 30,
+  "reportPath": "reports/recommend_detail_tmall.xlsx"
+}

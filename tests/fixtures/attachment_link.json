@@ -1,0 +1,6 @@
+{
+  "type": "attachment_preview",
+  "previewUrl": "https://www.zhipin.com/wflow/zpgeek/download/preview4boss/mock-geek-id?d=1774235295000&id=mock-resume-id&authType=0&previewType=1&geekId=mock-geek-id",
+  "viewerUrl": "https://www.zhipin.com/bzl-office/pdf-viewer-b?url=%2Fwflow%2Fzpgeek%2Fdownload%2Fpreview4boss%2Fmock-geek-id",
+  "checkUrl": "https://www.zhipin.com/wapi/zpgeek/resume/boss/preview/check.json?geekId=mock-geek-id&id=mock-resume-id&authType=0"
+}

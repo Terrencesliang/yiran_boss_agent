@@ -1,0 +1,16 @@
+{
+  "endpoint": "http://127.0.0.1:9222",
+  "urlContains": "/web/chat/recommend",
+  "jobTitle": "天猫运营",
+  "filters": {
+    "年龄": "28-35",
+    "薪资": "10-20k",
+    "经验要求": "3-5年"
+  },
+  "criteria": "有两年天猫电商经验",
+  "targetResumes": 5,
+  "maxGreetings": 5,
+  "operationDelaySeconds": 2,
+  "maxFilterRetries": 2,
+  "reportPath": "reports/recommend_detail_tmall_20260526_target5_delay2.xlsx"
+}

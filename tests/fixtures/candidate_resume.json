@@ -1,0 +1,17 @@
+{
+  "name": "周女士",
+  "candidateName": "周女士",
+  "expectedTitle": "电商运营经理",
+  "expectedCity": "深圳",
+  "yearsOfExperience": "6年电商渠道运营经验",
+  "education": "本科",
+  "currentTitle": "高级电商运营",
+  "skills": ["天猫", "京东", "小红书", "美妆", "投放", "团队管理"],
+  "workHighlights": [
+    "负责天猫、京东、小红书等平台运营",
+    "有美妆和个护类目经验",
+    "带领5人团队完成年度 GMV 增长"
+  ],
+  "rawTextPreview": "周女士 电商运营经理 深圳 6年电商渠道运营经验 本科 高级电商运营 负责天猫、京东、小红书等平台运营，有美妆和个护类目经验，带领5人团队完成年度 GMV 增长，熟悉投放和推广。",
+  "sourceUrl": "https://www.zhipin.com/web/boss/recommend"
+}

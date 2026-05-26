@@ -1,0 +1,20 @@
+[
+  {
+    "description": "",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/1",
+    "id": "1",
+    "title": "Boss直聘",
+    "type": "page",
+    "url": "https://www.zhipin.com/web/geek/chat",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1"
+  },
+  {
+    "description": "",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/2",
+    "id": "2",
+    "title": "候选人详情",
+    "type": "page",
+    "url": "https://www.zhipin.com/web/boss/recommend",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/2"
+  }
+]

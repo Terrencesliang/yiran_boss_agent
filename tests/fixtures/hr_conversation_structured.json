@@ -1,0 +1,48 @@
+{
+  "title": "BOSS直聘",
+  "url": "https://www.zhipin.com/web/chat/index",
+  "candidateName": "兰先生",
+  "company": "",
+  "role": "",
+  "jobTitle": "电商运营经理",
+  "salary": "15-20K",
+  "city": "深圳",
+  "messages": [
+    {
+      "direction": "system",
+      "time": "11:12",
+      "status": "",
+      "text": "3月23日 沟通的职位-电商运营经理"
+    },
+    {
+      "direction": "inbound",
+      "time": "",
+      "status": "",
+      "text": "您好，对贵公司很感兴趣，希望能和您聊聊"
+    },
+    {
+      "direction": "outbound",
+      "time": "11:26",
+      "status": "已读",
+      "text": "你好，你主要是做什么品类呢？"
+    },
+    {
+      "direction": "inbound",
+      "time": "11:32",
+      "status": "",
+      "text": "做过美妆日化、女装、新能源汽车配件"
+    },
+    {
+      "direction": "inbound",
+      "time": "",
+      "status": "",
+      "text": "对方想发送附件简历给您，您是否同意\n拒绝\n同意"
+    },
+    {
+      "direction": "system",
+      "time": "",
+      "status": "",
+      "text": "您可以在线预览牛人简历， 设置邮箱 后投递的简历会同时发送到您的邮箱。"
+    }
+  ]
+}

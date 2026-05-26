@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Browser/runtime state
+.chrome-profile*/
+downloads_before*.txt
+nul
+
+# Generated reports and local exports
+reports/
+*.xlsx
+*.xls
+*.csv
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
