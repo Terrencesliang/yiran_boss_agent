@@ -143,3 +143,96 @@ def test_analyze_resume_rejects_work_years_above_range(monkeypatch) -> None:
     )
 
     assert result["meetsCriteria"] is False
+
+
+def test_analyze_resume_matches_explicit_keyword_synonym_group(monkeypatch) -> None:
+    monkeypatch.delenv("BOSS_AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = analyze_resume_against_criteria(
+        resume_text=(
+            "王女士\n"
+            "28岁 5年 本科\n"
+            "曾负责淘宝店铺运营，包含商品上下架、活动策划和店铺日常数据分析。"
+        ),
+        criteria="关键词：天猫、投放",
+    )
+
+    assert result["meetsCriteria"] is True
+    assert result["keywordMatch"]["matched"] is True
+    assert result["keywordMatch"]["matches"][0]["keyword"] == "天猫"
+    assert result["keywordMatch"]["matches"][0]["matchedTerm"] == "淘宝"
+    assert "淘宝店铺运营" in result["keywordMatch"]["matches"][0]["evidenceText"]
+    assert result["keywordMatch"]["matches"][0]["evidenceSummary"]
+    assert "淘宝" in result["keywordMatch"]["matches"][0]["evidenceSummary"]
+
+
+def test_analyze_resume_matches_explicit_keyword_delivery_synonym(monkeypatch) -> None:
+    monkeypatch.delenv("BOSS_AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = analyze_resume_against_criteria(
+        resume_text=(
+            "陈先生\n"
+            "30岁 6年 本科\n"
+            "负责直通车、千川推广和信息流广告优化，提升店铺成交。"
+        ),
+        criteria="关键词：投放",
+    )
+
+    assert result["meetsCriteria"] is True
+    assert result["keywordMatch"]["matches"][0]["matchedTerm"] in {"直通车", "千川", "推广", "信息流"}
+
+
+def test_analyze_resume_rejects_when_explicit_keyword_missing(monkeypatch) -> None:
+    monkeypatch.delenv("BOSS_AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = analyze_resume_against_criteria(
+        resume_text=(
+            "李女士\n"
+            "27岁 4年 本科\n"
+            "主要负责线下门店陈列、客户接待和库存盘点。"
+        ),
+        criteria="关键词：天猫",
+    )
+
+    assert result["meetsCriteria"] is False
+    assert result["keywordMatch"]["matched"] is False
+    assert result["keywordMatch"]["matches"] == []
+    assert any("未识别到关键词或同义词" in risk for risk in result["risks"])
+
+
+def test_analyze_resume_accepts_any_explicit_keyword_group(monkeypatch) -> None:
+    monkeypatch.delenv("BOSS_AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = analyze_resume_against_criteria(
+        resume_text=(
+            "周先生\n"
+            "29岁 5年 本科\n"
+            "HRBP 背景，负责招聘配置、岗位需求沟通和人才盘点。"
+        ),
+        criteria="关键词：天猫、招聘",
+    )
+
+    assert result["meetsCriteria"] is True
+    assert result["keywordMatch"]["matched"] is True
+    assert any(match["keyword"] == "招聘" for match in result["keywordMatch"]["matches"])
+
+
+def test_analyze_resume_keyword_match_does_not_override_other_failed_criteria(monkeypatch) -> None:
+    monkeypatch.delenv("BOSS_AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = analyze_resume_against_criteria(
+        resume_text=(
+            "赵女士\n"
+            "26岁 4年 大专\n"
+            "负责淘宝店铺运营和平台活动。"
+        ),
+        criteria="本科，关键词：天猫",
+    )
+
+    assert result["keywordMatch"]["matched"] is True
+    assert result["meetsCriteria"] is False

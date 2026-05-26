@@ -1357,6 +1357,7 @@ def _write_recommend_detail_report(
                 "candidate_summary": analysis.get("candidateSummary", ""),
                 "reasons": "；".join(analysis.get("reasons", [])),
                 "risks": "；".join(analysis.get("risks", [])),
+                "keyword_evidence": _format_keyword_evidence(analysis),
                 "criteria": criteria,
                 "agent": analysis.get("agent", ""),
                 "analysis_input_source": analysis.get("analysisInputSource", ""),
@@ -1379,7 +1380,7 @@ def _write_recommend_detail_report(
             sheet.title = "recommend_detail"
             headers = list(rows[0].keys()) if rows else [
                 "checked_at", "job_title", "candidate", "meets_criteria", "greeted",
-                "greet_status", "candidate_summary", "reasons", "risks", "criteria",
+                "greet_status", "candidate_summary", "reasons", "risks", "keyword_evidence", "criteria",
                 "agent", "analysis_input_source", "analysis_input_length",
                 "resume_source", "ocr_status", "ocr_error", "resume_preview"
             ]
@@ -1400,6 +1401,24 @@ def _write_recommend_detail_report(
 
     _write_rows_csv(report_path, rows)
     return {"path": str(report_path), "format": "csv", "rowCount": len(rows)}
+
+
+def _format_keyword_evidence(analysis: dict[str, Any]) -> str:
+    matches = ((analysis.get("keywordMatch") or {}).get("matches") or [])
+    pieces: list[str] = []
+    for match in matches:
+        keyword = str(match.get("keyword") or "").strip()
+        matched_term = str(match.get("matchedTerm") or "").strip()
+        summary = str(match.get("evidenceSummary") or "").strip()
+        evidence = str(match.get("evidenceText") or "").strip()
+        if not (keyword or matched_term or summary or evidence):
+            continue
+        label = f"{keyword} -> {matched_term}".strip(" ->")
+        detail = summary or evidence
+        if evidence and evidence not in detail:
+            detail = f"{detail}（{evidence}）" if detail else evidence
+        pieces.append(f"{label}：{detail}" if label and detail else label or detail)
+    return "；".join(pieces)
 
 
 def _screen_and_greet_recommendations(

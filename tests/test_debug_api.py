@@ -13,6 +13,7 @@ from boss_agent.chrome_debug import build_download_click_probe_expression
 from boss_agent.chrome_debug import build_chrome_launch_command
 from boss_agent.chrome_debug import classify_page
 from boss_agent.cli import _load_screen_recommend_detail_config
+from boss_agent.cli import _format_keyword_evidence
 from boss_agent.cli import _screen_recommend_detail
 from boss_agent.drafting import draft_reply
 from boss_agent.knowledge_base import answer_question_from_knowledge
@@ -24,6 +25,27 @@ from boss_agent.scoring import score_conversation
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_format_keyword_evidence_includes_summary_and_source_text() -> None:
+    analysis = {
+        "keywordMatch": {
+            "matches": [
+                {
+                    "keyword": "天猫",
+                    "matchedTerm": "淘宝",
+                    "evidenceSummary": "命中淘宝：曾负责淘宝店铺运营",
+                    "evidenceText": "曾负责淘宝店铺运营，包含商品上下架、活动策划和店铺日常数据分析。",
+                }
+            ]
+        }
+    }
+
+    result = _format_keyword_evidence(analysis)
+
+    assert "天猫 -> 淘宝" in result
+    assert "命中淘宝" in result
+    assert "淘宝店铺运营" in result
 
 
 def test_list_pages_uses_json_list_payload() -> None:

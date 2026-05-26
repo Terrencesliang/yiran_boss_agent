@@ -8,6 +8,16 @@ from urllib.request import Request
 from urllib.request import urlopen
 
 
+KEYWORD_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("天猫", "淘宝", "京东", "抖音", "小红书", "拼多多", "电商", "平台电商", "线上店铺"),
+    ("店铺运营", "店长", "平台运营", "类目运营", "商品运营", "电商运营", "运营管理"),
+    ("投放", "推广", "千川", "直通车", "钻展", "信息流", "广告投放", "付费推广"),
+    ("美妆", "护肤", "彩妆", "个护", "化妆品", "美容"),
+    ("招聘", "猎头", "人事", "hr", "hrbp", "人力资源", "人才"),
+    ("行政", "前台", "文员", "会务", "助理", "行政专员"),
+)
+
+
 def analyze_resume_against_criteria(
     resume_text: str,
     criteria: str,
@@ -16,20 +26,21 @@ def analyze_resume_against_criteria(
     resume_text = _strip_non_resume_sections(resume_text)
     if _has_llm_config():
         try:
-            return _analyze_with_openai_compatible_api(
+            result = _analyze_with_openai_compatible_api(
                 resume_text=resume_text,
                 criteria=criteria,
                 model=model or os.environ.get("BOSS_AGENT_LLM_MODEL") or "gpt-4.1-mini",
             )
+            return _apply_explicit_keyword_check(result, resume_text=resume_text, criteria=criteria)
         except Exception as exc:
             fallback = _analyze_with_rules(resume_text=resume_text, criteria=criteria)
             fallback["agent"] = "rules_fallback_after_llm_error"
             fallback["llmError"] = str(exc)
-            return fallback
+            return _apply_explicit_keyword_check(fallback, resume_text=resume_text, criteria=criteria)
 
     fallback = _analyze_with_rules(resume_text=resume_text, criteria=criteria)
     fallback["agent"] = "rules_fallback_no_llm_config"
-    return fallback
+    return _apply_explicit_keyword_check(fallback, resume_text=resume_text, criteria=criteria)
 
 
 def _strip_non_resume_sections(resume_text: str) -> str:
@@ -121,6 +132,164 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
+def _apply_explicit_keyword_check(result: dict[str, Any], resume_text: str, criteria: str) -> dict[str, Any]:
+    keywords = _extract_explicit_keywords(criteria)
+    if not keywords:
+        return result
+
+    keyword_match = _match_keyword_groups(resume_text=resume_text, keywords=keywords)
+    updated = {**result}
+    reasons = _string_list(updated.get("reasons"))
+    risks = _string_list(updated.get("risks"))
+    if keyword_match["matched"]:
+        reasons.append(
+            "关键词/同义词匹配："
+            + "；".join(
+                f"{item['keyword']} -> {item['matchedTerm']}"
+                for item in keyword_match["matches"]
+            )
+        )
+    else:
+        risks.append("未识别到关键词或同义词：" + "、".join(keywords))
+
+    updated["meetsCriteria"] = bool(updated.get("meetsCriteria")) and bool(keyword_match["matched"])
+    updated["reasons"] = reasons
+    updated["risks"] = risks
+    updated["keywordMatch"] = keyword_match
+    return updated
+
+
+def _extract_explicit_keywords(criteria: str) -> list[str]:
+    match = re.search(r"(?:关键词|关键字)\s*[:：]\s*(.+)", str(criteria or ""), flags=re.IGNORECASE)
+    if not match:
+        return []
+    raw = match.group(1).splitlines()[0]
+    tokens = re.split(r"[、,，;；\s]+", raw)
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        keyword = token.strip(" ：:。.!！?？()（）[]【】")
+        if not keyword or _looks_like_non_keyword_requirement(keyword):
+            continue
+        normalized = _normalize_keyword_text(keyword)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            keywords.append(keyword)
+    return keywords
+
+
+def _looks_like_non_keyword_requirement(value: str) -> bool:
+    return bool(
+        re.fullmatch(r"\d{1,2}\s*[-到至~～]\s*\d{1,2}\s*岁?", value)
+        or re.fullmatch(r"\d{1,2}\s*[-到至~～]\s*\d{1,2}\s*年", value)
+        or re.fullmatch(r"[一二两三四五六七八九十\d]+\s*年(?:以上|工作|经验)?", value)
+        or value in {"本科", "大专", "专科", "硕士", "研究生", "博士", "中专"}
+    )
+
+
+def _expand_keyword_synonyms(keyword: str) -> list[str]:
+    normalized_keyword = _normalize_keyword_text(keyword)
+    synonyms: list[str] = [keyword]
+    seen = {normalized_keyword}
+    for group in KEYWORD_SYNONYM_GROUPS:
+        normalized_group = [_normalize_keyword_text(item) for item in group]
+        if any(
+            normalized_keyword == item
+            or normalized_keyword in item
+            or item in normalized_keyword
+            for item in normalized_group
+        ):
+            for term in group:
+                normalized_term = _normalize_keyword_text(term)
+                if normalized_term and normalized_term not in seen:
+                    seen.add(normalized_term)
+                    synonyms.append(term)
+    return synonyms
+
+
+def _match_keyword_groups(resume_text: str, keywords: list[str]) -> dict[str, Any]:
+    normalized_resume = _normalize_keyword_text(resume_text)
+    matches: list[dict[str, str]] = []
+    expanded: dict[str, list[str]] = {}
+    for keyword in keywords:
+        synonyms = _expand_keyword_synonyms(keyword)
+        expanded[keyword] = synonyms
+        matched_term = next(
+            (term for term in synonyms if _normalize_keyword_text(term) in normalized_resume),
+            "",
+        )
+        if matched_term:
+            evidence_text = _find_keyword_evidence(resume_text=resume_text, terms=synonyms)
+            matches.append(
+                {
+                    "keyword": keyword,
+                    "matchedTerm": matched_term,
+                    "evidenceText": evidence_text,
+                    "evidenceSummary": _summarize_keyword_evidence(
+                        keyword=keyword,
+                        matched_term=matched_term,
+                        evidence_text=evidence_text,
+                    ),
+                }
+            )
+    return {
+        "required": True,
+        "matched": bool(matches),
+        "keywords": keywords,
+        "expanded": expanded,
+        "matches": matches,
+    }
+
+
+def _find_keyword_evidence(resume_text: str, terms: list[str], max_length: int = 160) -> str:
+    text = str(resume_text or "")
+    normalized_terms = [
+        _normalize_keyword_text(term)
+        for term in terms
+        if _normalize_keyword_text(term)
+    ]
+    paragraphs = [
+        re.sub(r"\s+", " ", part).strip()
+        for part in re.split(r"[\r\n]+", text)
+        if part.strip()
+    ]
+    for paragraph in paragraphs:
+        normalized_paragraph = _normalize_keyword_text(paragraph)
+        if any(term in normalized_paragraph for term in normalized_terms):
+            return _trim_evidence_text(paragraph, max_length=max_length)
+
+    compact_text = re.sub(r"\s+", " ", text).strip()
+    normalized_text = _normalize_keyword_text(compact_text)
+    positions = [
+        normalized_text.find(term)
+        for term in normalized_terms
+        if normalized_text.find(term) >= 0
+    ]
+    if not positions:
+        return ""
+    start = max(0, min(positions) - max_length // 3)
+    end = min(len(compact_text), start + max_length)
+    return _trim_evidence_text(compact_text[start:end], max_length=max_length)
+
+
+def _trim_evidence_text(value: str, max_length: int = 160) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1].rstrip() + "…"
+
+
+def _summarize_keyword_evidence(keyword: str, matched_term: str, evidence_text: str) -> str:
+    if not evidence_text:
+        return f"命中{matched_term}，与{keyword}要求相关"
+    sentence = _trim_evidence_text(evidence_text, max_length=72)
+    return f"命中{matched_term}：{sentence}"
+
+
+def _normalize_keyword_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
 def _analyze_with_rules(resume_text: str, criteria: str) -> dict[str, Any]:
     lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
     name = _extract_name(lines)
@@ -136,6 +305,7 @@ def _analyze_with_rules(resume_text: str, criteria: str) -> dict[str, Any]:
     age = _extract_age(summary, resume_text)
     work_years = _extract_work_years(summary, resume_text)
     parsed_criteria = _parse_criteria(criteria)
+    explicit_keywords = _extract_explicit_keywords(criteria)
     meets = True
     reasons: list[str] = []
     risks: list[str] = []
@@ -178,7 +348,7 @@ def _analyze_with_rules(resume_text: str, criteria: str) -> dict[str, Any]:
         else:
             risks.append(f"工作经验不满足 {min_work_years} 年要求，识别为 {work_years if work_years is not None else '未知'}")
 
-    composite_match = _match_composite_experience(criteria=criteria, resume_text=resume_text)
+    composite_match = {"required": False} if explicit_keywords else _match_composite_experience(criteria=criteria, resume_text=resume_text)
     if composite_match.get("required"):
         meets = meets and bool(composite_match.get("matched"))
         if composite_match.get("matched"):
@@ -186,7 +356,7 @@ def _analyze_with_rules(resume_text: str, criteria: str) -> dict[str, Any]:
         else:
             risks.append(str(composite_match.get("reason") or "详情页未识别到组合经验"))
 
-    keywords = parsed_criteria.get("experienceKeywords") or []
+    keywords = [] if explicit_keywords else (parsed_criteria.get("experienceKeywords") or [])
     if keywords and not composite_match.get("required"):
         normalized_resume = resume_text.replace("\n", " ")
         matched_keywords = [keyword for keyword in keywords if keyword in normalized_resume]
