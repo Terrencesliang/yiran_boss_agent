@@ -1348,6 +1348,69 @@ def test_screen_recommend_detail_stops_when_filter_verification_fails(tmp_path: 
     assert result["search"]["unverifiedFilters"] == ["\u5e74\u9f84"]
 
 
+def test_screen_recommend_detail_reapplies_all_filters_after_job_retry(tmp_path: Path) -> None:
+    class JobRetryClient(ChromeDebugClient):
+        def __init__(self) -> None:
+            super().__init__(endpoint="http://127.0.0.1:9222", mock_dir=FIXTURES)
+            self.switch_attempts = 0
+            self.applied_filter_sets: list[dict[str, str]] = []
+
+        def switch_recommend_job_filter(
+            self,
+            job_text: str,
+            url_contains: str | None = "/web/chat/recommend",
+        ) -> dict:
+            self.switch_attempts += 1
+            return {
+                "switched": self.switch_attempts >= 2,
+                "jobText": job_text,
+                "selected": "其他职位" if self.switch_attempts == 1 else job_text,
+            }
+
+        def apply_recommend_filters(
+            self,
+            job_title="",
+            city="",
+            filters=None,
+            url_contains="/web/chat/recommend",
+            operation_delay_seconds=0,
+            max_filter_retries=2,
+        ) -> dict:
+            self.applied_filter_sets.append(dict(filters or {}))
+            return {
+                "filters": filters or {},
+                "appliedFilters": list((filters or {}).keys()),
+                "missingFilters": [],
+                "unverifiedFilters": [],
+                "filterVerificationPassed": True,
+            }
+
+    client = JobRetryClient()
+    filters = {"年龄": "28-35", "薪资": "10-20k", "经验要求": "3-5年", "学历": "本科"}
+
+    result = _screen_recommend_detail(
+        client=client,
+        url_contains="/web/chat/recommend",
+        job_title="天猫运营",
+        city="",
+        filters=filters,
+        criteria="关键词：天猫",
+        model=None,
+        max_greetings=1,
+        max_checks=0,
+        post_filter_wait_seconds=0,
+        report_path=tmp_path / "recommend_detail.csv",
+        dry_run=True,
+        max_filter_retries=2,
+    )
+
+    assert result.get("reason") != "job_filter_verification_failed"
+    assert client.switch_attempts == 2
+    assert client.applied_filter_sets == [filters, filters]
+    assert result["switchJob"]["attemptCount"] == 2
+    assert result["search"]["jobFilterAttemptCount"] == 2
+
+
 def test_apply_recommend_filters_retries_only_failed_filter() -> None:
     class PartialRetryClient(ChromeDebugClient):
         def __init__(self):

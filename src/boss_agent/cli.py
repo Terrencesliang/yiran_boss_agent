@@ -893,22 +893,20 @@ def _screen_recommend_detail(
         operation_delay()
     except Exception as exc:
         pre_filter_close = {"closed": False, "reason": str(exc)}
-    switch_job = None
-    if job_title.strip():
-        switch_job = client.switch_recommend_job_filter(job_text=job_title, url_contains=url_contains)
-        operation_delay()
-
-    search_result = client.apply_recommend_filters(
-        job_title="",
+    switch_job, search_result = _apply_recommend_job_and_filters(
+        client=client,
+        url_contains=url_contains,
+        job_title=job_title,
         city=city,
         filters=filters,
-        url_contains=url_contains,
+        operation_delay=operation_delay,
         operation_delay_seconds=operation_delay_seconds,
         max_filter_retries=max_filter_retries,
     )
     operation_delay()
+    hard_job_failure = bool(job_title.strip() and switch_job and switch_job.get("switched") is False)
     hard_filter_failure = bool(filters and search_result.get("filterVerificationPassed") is False)
-    if hard_filter_failure:
+    if hard_job_failure or hard_filter_failure:
         report = _write_recommend_detail_report(
             report_path=report_path,
             criteria=criteria,
@@ -940,7 +938,7 @@ def _screen_recommend_detail(
                 "url": "",
                 "candidateCount": 0,
             },
-            "reason": "filter_verification_failed",
+            "reason": "job_filter_verification_failed" if hard_job_failure else "filter_verification_failed",
         }
     if post_filter_wait_seconds > 0:
         time.sleep(post_filter_wait_seconds)
@@ -1140,6 +1138,58 @@ def _screen_recommend_detail(
             "candidateCount": candidates_payload.get("count", 0),
         },
     }
+
+
+def _apply_recommend_job_and_filters(
+    client: ChromeDebugClient,
+    url_contains: str,
+    job_title: str,
+    city: str,
+    filters: dict[str, str],
+    operation_delay: Any,
+    operation_delay_seconds: float,
+    max_filter_retries: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    switch_job: dict[str, Any] | None = None
+    search_result: dict[str, Any] = {}
+    max_attempts = max(1, max_filter_retries + 1)
+
+    for attempt in range(1, max_attempts + 1):
+        if job_title.strip():
+            switch_job = client.switch_recommend_job_filter(job_text=job_title, url_contains=url_contains)
+            operation_delay()
+
+        search_result = client.apply_recommend_filters(
+            job_title="",
+            city=city,
+            filters=filters,
+            url_contains=url_contains,
+            operation_delay_seconds=operation_delay_seconds,
+            max_filter_retries=max_filter_retries,
+        )
+        operation_delay()
+
+        job_failed = bool(job_title.strip() and switch_job and switch_job.get("switched") is False)
+        attempts.append(
+            {
+                "attempt": attempt,
+                "switchJob": switch_job,
+                "search": search_result,
+                "reason": "job_filter_not_switched" if job_failed else "",
+            }
+        )
+        if not job_failed:
+            break
+
+    if switch_job is not None:
+        switch_job = {**switch_job, "retryHistory": attempts[:-1], "attemptCount": len(attempts)}
+    search_result = {
+        **search_result,
+        "jobFilterRetryHistory": attempts[:-1],
+        "jobFilterAttemptCount": len(attempts),
+    }
+    return switch_job, search_result
 
 
 def _recommend_candidate_dedupe_key(
