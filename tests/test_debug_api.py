@@ -14,6 +14,7 @@ from boss_agent.chrome_debug import build_chrome_launch_command
 from boss_agent.chrome_debug import classify_page
 from boss_agent.cli import _load_screen_recommend_detail_config
 from boss_agent.cli import _format_keyword_evidence
+from boss_agent.cli import _request_resume_new_greetings
 from boss_agent.cli import _screen_recommend_detail
 from boss_agent.drafting import draft_reply
 from boss_agent.knowledge_base import answer_question_from_knowledge
@@ -563,6 +564,199 @@ def test_switch_job_filter_from_mock_returns_selected_job() -> None:
 
     assert result["switched"] is True
     assert result["selected"] == "销售 _ 广州 8-12K"
+
+
+def test_switch_conversation_status_tab_from_mock_matches_new_greeting_count() -> None:
+    client = ChromeDebugClient(
+        endpoint="http://127.0.0.1:9222",
+        mock_dir=FIXTURES,
+    )
+
+    result = client.switch_conversation_status_tab(label="\u65b0\u62db\u547c", url_contains="/web/chat/index")
+
+    assert result["switched"] is True
+    assert result["matchedText"] == "\u65b0\u62db\u547c(45)"
+
+
+def test_click_request_resume_button_from_mock_returns_click_result() -> None:
+    client = ChromeDebugClient(
+        endpoint="http://127.0.0.1:9222",
+        mock_dir=FIXTURES,
+    )
+
+    result = client.click_request_resume_button(url_contains="/web/chat/index")
+
+    assert result["clicked"] is True
+    assert result["text"] == "\u6c42\u7b80\u5386"
+
+
+class RequestResumeFakeClient:
+    def __init__(
+        self,
+        *,
+        job_switched: bool = True,
+        conversation_text: str = "\u5019\u9009\u4eba\u60f3\u6c9f\u901a",
+        request_resume_clicked: bool = True,
+    ) -> None:
+        self.job_switched = job_switched
+        self.conversation_text = conversation_text
+        self.request_resume_clicked = request_resume_clicked
+        self.filled_messages = []
+
+    def switch_conversation_status_tab(self, label: str, url_contains=None) -> dict:
+        return {"switched": True, "label": label, "matchedText": "\u65b0\u62db\u547c(45)"}
+
+    def switch_job_filter(self, job_text: str, url_contains=None) -> dict:
+        return {"switched": self.job_switched, "jobText": job_text, "selected": job_text if self.job_switched else ""}
+
+    def switch_message_filter(self, label: str, url_contains=None) -> dict:
+        return {"switched": True, "label": label}
+
+    def capture_unread_inbox_scrolled(
+        self,
+        url_contains=None,
+        max_items: int = 200,
+        max_scrolls: int = 20,
+    ) -> dict:
+        return {
+            "activeFilter": "\u672a\u8bfb",
+            "count": 1,
+            "scrollCapture": {"enabled": True, "maxItems": max_items, "maxScrolls": max_scrolls},
+            "conversations": [
+                {
+                    "dataId": "candidate-1",
+                    "candidateName": "\u674e\u5973\u58eb",
+                    "jobTitle": "\u6587\u5458 _ \u73e0\u6d77 5-6K",
+                    "summary": "\u60a8\u597d",
+                }
+            ],
+        }
+
+    def open_conversation(
+        self,
+        data_id=None,
+        candidate_name=None,
+        url_contains=None,
+        max_scrolls: int = 20,
+    ) -> dict:
+        return {"opened": True, "dataId": data_id, "candidateName": candidate_name}
+
+    def wait_for_conversation_ready(
+        self,
+        expected_candidate_name=None,
+        expected_job_title=None,
+        url_contains=None,
+    ) -> dict:
+        return {
+            "ready": True,
+            "conversation": {
+                "candidateName": expected_candidate_name,
+                "jobTitle": expected_job_title,
+                "messages": [{"direction": "inbound", "text": self.conversation_text}],
+            },
+        }
+
+    def fill_chat_input(self, body: str, url_contains=None) -> dict:
+        self.filled_messages.append(body)
+        return {"filled": True, "body": body}
+
+    def send_current_message(self, url_contains=None) -> dict:
+        return {"sent": True}
+
+    def click_request_resume_button(self, url_contains=None) -> dict:
+        if not self.request_resume_clicked:
+            return {"clicked": False, "reason": "not_found", "text": "\u6c42\u7b80\u5386"}
+        return {"clicked": True, "text": "\u6c42\u7b80\u5386"}
+
+    def close_attachment_preview(self, url_contains=None) -> dict:
+        return {"closed": True}
+
+
+def test_request_resume_new_greetings_send_clicks_message_and_resume_button() -> None:
+    client = RequestResumeFakeClient()
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        message="\u60a8\u597d\uff0c\u65b9\u4fbf\u53d1\u4e00\u4efd\u7b80\u5386\u5417\uff1f",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["dryRun"] is False
+    assert result["successCount"] == 1
+    assert result["failedCount"] == 0
+    assert result["results"][0]["send"]["sent"] is True
+    assert result["results"][0]["requestResume"]["clicked"] is True
+    assert client.filled_messages == ["\u60a8\u597d\uff0c\u65b9\u4fbf\u53d1\u4e00\u4efd\u7b80\u5386\u5417\uff1f"]
+
+
+def test_request_resume_new_greetings_skips_existing_resume_request() -> None:
+    client = RequestResumeFakeClient(conversation_text="\u5bf9\u65b9\u60f3\u53d1\u9001\u9644\u4ef6\u7b80\u5386\u7ed9\u60a8")
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["successCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["results"][0]["reason"] == "resume_already_requested_or_present"
+    assert result["results"][0]["send"] is None
+
+
+def test_request_resume_new_greetings_stops_when_job_filter_fails() -> None:
+    client = RequestResumeFakeClient(job_switched=False)
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u4e0d\u5b58\u5728\u804c\u4f4d",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["reason"] == "job_filter_not_switched"
+    assert result["snapshotCount"] == 0
+    assert result["processedCount"] == 0
+
+
+def test_request_resume_new_greetings_continues_when_resume_button_missing() -> None:
+    client = RequestResumeFakeClient(request_resume_clicked=False)
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["successCount"] == 0
+    assert result["failedCount"] == 1
+    assert result["processedCount"] == 1
+    assert result["results"][0]["send"]["sent"] is True
+    assert result["results"][0]["requestResume"]["clicked"] is False
+    assert result["results"][0]["reason"] == "not_found"
 
 
 def test_capture_recommend_resume_cards_from_mock_returns_cards() -> None:

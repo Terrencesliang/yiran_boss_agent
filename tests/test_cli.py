@@ -467,6 +467,39 @@ def test_action_send_unread_message_switches_job_and_sends_custom_message() -> N
     assert payload["results"][0]["send"]["sent"] is True
 
 
+def test_action_request_resume_new_greetings_defaults_to_dry_run() -> None:
+    result = run_cli(
+        "action",
+        "request-resume-new-greetings",
+        "--mock-dir",
+        "tests/fixtures",
+        "--url-contains",
+        "/web/chat/index",
+        "--job-text",
+        "\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        "--max-count",
+        "2",
+        "--inbox-scrolls",
+        "5",
+        "--wait-after-unread",
+        "0",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["dryRun"] is True
+    assert payload["message"] == "\u60a8\u597d\uff0c\u65b9\u4fbf\u53d1\u4e00\u4efd\u7b80\u5386\u5417\uff1f\u6211\u8fd9\u8fb9\u5148\u770b\u4e00\u4e0b\u3002"
+    assert payload["switchStatusTab"]["matchedText"] == "\u65b0\u62db\u547c(45)"
+    assert payload["switchJobFilter"]["switched"] is True
+    assert payload["switchUnreadFilter"]["label"] == "\u672a\u8bfb"
+    assert payload["snapshotCount"] == 2
+    assert payload["processedCount"] == 2
+    assert payload["skippedCount"] == 2
+    assert payload["results"][0]["reason"] == "dry_run"
+    assert payload["results"][0]["send"] is None
+    assert payload["results"][0]["requestResume"] is None
+
+
 def test_action_process_unread_with_fallback_today_processes_today_items_from_all() -> None:
     result = run_cli(
         "action",

@@ -156,6 +156,18 @@ def build_parser() -> argparse.ArgumentParser:
     send_unread_message_parser.add_argument("--delay-seconds", type=float, default=1.0)
     send_unread_message_parser.add_argument("--dry-run", action="store_true")
 
+    request_resume_parser = action_subparsers.add_parser("request-resume-new-greetings")
+    request_resume_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
+    request_resume_parser.add_argument("--mock-dir")
+    request_resume_parser.add_argument("--url-contains", default="/web/chat/index")
+    request_resume_parser.add_argument("--job-text", required=True)
+    request_resume_parser.add_argument("--message", default="您好，方便发一份简历吗？我这边先看一下。")
+    request_resume_parser.add_argument("--max-count", type=int, default=50)
+    request_resume_parser.add_argument("--inbox-scrolls", type=int, default=20)
+    request_resume_parser.add_argument("--wait-after-unread", type=float, default=3.0)
+    request_resume_parser.add_argument("--operation-delay-seconds", type=float, default=2.0)
+    request_resume_parser.add_argument("--send", action="store_true")
+
     process_all_today_parser = action_subparsers.add_parser("process-all-today")
     process_all_today_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
     process_all_today_parser.add_argument("--mock-dir")
@@ -507,6 +519,22 @@ def main(argv: list[str] | None = None) -> int:
                     inbox_scrolls=args.inbox_scrolls,
                     delay_seconds=args.delay_seconds,
                     dry_run=args.dry_run,
+                )
+            )
+        if args.action_command == "request-resume-new-greetings":
+            fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
+            client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
+            return _print_json(
+                _request_resume_new_greetings(
+                    client=client,
+                    url_contains=args.url_contains,
+                    job_text=args.job_text,
+                    message=args.message,
+                    max_count=args.max_count,
+                    inbox_scrolls=args.inbox_scrolls,
+                    wait_after_unread=args.wait_after_unread,
+                    operation_delay_seconds=args.operation_delay_seconds,
+                    send=args.send,
                 )
             )
         if args.action_command == "process-all-today":
@@ -1696,6 +1724,263 @@ def _write_rows_csv(report_path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(file, fieldnames=headers)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _request_resume_new_greetings(
+    client: ChromeDebugClient,
+    url_contains: str,
+    job_text: str,
+    message: str,
+    max_count: int,
+    inbox_scrolls: int,
+    wait_after_unread: float,
+    operation_delay_seconds: float,
+    send: bool,
+) -> dict[str, Any]:
+    dry_run = not send
+    switch_status = client.switch_conversation_status_tab(label="\u65b0\u62db\u547c", url_contains=url_contains)
+    if not switch_status.get("switched"):
+        return _request_resume_new_greetings_stopped(
+            job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+            switch_status, None, None, None, "status_tab_not_switched",
+        )
+    _sleep_operation_delay(operation_delay_seconds)
+
+    switch_job = client.switch_job_filter(job_text=job_text, url_contains=url_contains)
+    if not switch_job.get("switched"):
+        return _request_resume_new_greetings_stopped(
+            job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+            switch_status, switch_job, None, None, "job_filter_not_switched",
+        )
+    _sleep_operation_delay(operation_delay_seconds)
+
+    switch_unread = client.switch_message_filter(label="\u672a\u8bfb", url_contains=url_contains)
+    _sleep_operation_delay(operation_delay_seconds)
+    if wait_after_unread > 0:
+        time.sleep(wait_after_unread)
+    inbox = client.capture_unread_inbox_scrolled(
+        url_contains=url_contains,
+        max_items=max_count,
+        max_scrolls=inbox_scrolls,
+    )
+    conversations = [item for item in inbox.get("conversations", []) if item.get("dataId")][:max_count]
+    results: list[dict[str, Any]] = []
+
+    for item in conversations:
+        if dry_run:
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": None,
+                    "conversationReady": None,
+                    "fill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "closeAttachmentPreview": None,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "dry_run",
+                }
+            )
+            _sleep_operation_delay(operation_delay_seconds)
+            continue
+
+        open_result = client.open_conversation(
+            data_id=item.get("dataId"),
+            candidate_name=item.get("candidateName"),
+            url_contains=url_contains,
+            max_scrolls=inbox_scrolls,
+        )
+        _sleep_operation_delay(operation_delay_seconds)
+        readiness = client.wait_for_conversation_ready(
+            expected_candidate_name=item.get("candidateName"),
+            expected_job_title=item.get("jobTitle"),
+            url_contains=url_contains,
+        )
+        if not readiness.get("ready"):
+            close_result = client.close_attachment_preview(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "conversation_not_ready",
+                }
+            )
+            continue
+
+        conversation = readiness.get("conversation", {})
+        if _conversation_has_resume_request_or_attachment(conversation):
+            close_result = client.close_attachment_preview(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "resume_already_requested_or_present",
+                }
+            )
+            continue
+
+        already_sent_message = _conversation_has_outbound_resume_request_text(conversation, message)
+        fill_result = None
+        send_result = None
+        request_resume = None
+        reason = ""
+        if already_sent_message:
+            request_resume = client.click_request_resume_button(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            if not request_resume.get("clicked"):
+                reason = str(request_resume.get("reason") or "request_resume_button_not_clicked")
+        else:
+            fill_result = client.fill_chat_input(message, url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            if fill_result.get("filled"):
+                send_result = client.send_current_message(url_contains=url_contains)
+                _sleep_operation_delay(operation_delay_seconds)
+                if send_result.get("sent"):
+                    request_resume = client.click_request_resume_button(url_contains=url_contains)
+                    _sleep_operation_delay(operation_delay_seconds)
+                    if not request_resume.get("clicked"):
+                        reason = str(request_resume.get("reason") or "request_resume_button_not_clicked")
+                else:
+                    reason = str(send_result.get("reason") or "send_failed")
+            else:
+                reason = str(fill_result.get("reason") or "fill_failed")
+        close_result = client.close_attachment_preview(url_contains=url_contains)
+        _sleep_operation_delay(operation_delay_seconds)
+        success = bool(
+            request_resume and request_resume.get("clicked")
+            and (already_sent_message or (send_result and send_result.get("sent")))
+        )
+        results.append(
+            {
+                "target": item,
+                "openConversation": open_result,
+                "conversationReady": readiness,
+                "fill": fill_result,
+                "send": send_result,
+                "requestResume": request_resume,
+                "closeAttachmentPreview": close_result,
+                "success": success,
+                "skipped": False,
+                "alreadySentMessage": already_sent_message,
+                "reason": "" if success else reason,
+            }
+        )
+
+    return _request_resume_new_greetings_payload(
+        job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+        switch_status, switch_job, switch_unread, inbox, conversations, results,
+    )
+
+
+def _sleep_operation_delay(operation_delay_seconds: float) -> None:
+    if operation_delay_seconds > 0:
+        time.sleep(operation_delay_seconds)
+
+
+def _conversation_has_resume_request_or_attachment(conversation: dict[str, Any]) -> bool:
+    markers = [
+        "\u6c42\u7b80\u5386",
+        "\u8fd9\u662f\u6211\u7684\u7b80\u5386",
+        "\u6211\u7684\u7b80\u5386",
+        "\u7b80\u5386\u8bf7\u6c42\u5df2\u53d1\u9001",
+        "\u5bf9\u65b9\u60f3\u53d1\u9001\u9644\u4ef6\u7b80\u5386",
+        "\u70b9\u51fb\u9884\u89c8\u9644\u4ef6\u7b80\u5386",
+        "\u9644\u4ef6\u7b80\u5386",
+    ]
+    return any(
+        any(marker in (message.get("text") or "") for marker in markers)
+        for message in conversation.get("messages", [])
+    )
+
+
+def _conversation_has_outbound_resume_request_text(conversation: dict[str, Any], message: str) -> bool:
+    outbound_texts = [
+        (item.get("text") or "").strip()
+        for item in conversation.get("messages", [])
+        if item.get("direction") == "outbound"
+    ]
+    return any(
+        text == message.strip() or "\u65b9\u4fbf\u53d1\u4e00\u4efd\u7b80\u5386" in text
+        for text in outbound_texts
+    )
+
+
+def _request_resume_new_greetings_stopped(
+    job_text: str,
+    message: str,
+    dry_run: bool,
+    inbox_scrolls: int,
+    wait_after_unread: float,
+    operation_delay_seconds: float,
+    switch_status: dict[str, Any] | None,
+    switch_job: dict[str, Any] | None,
+    switch_unread: dict[str, Any] | None,
+    inbox: dict[str, Any] | None,
+    reason: str,
+) -> dict[str, Any]:
+    return _request_resume_new_greetings_payload(
+        job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+        switch_status, switch_job, switch_unread, inbox, [], [], reason,
+    )
+
+
+def _request_resume_new_greetings_payload(
+    job_text: str,
+    message: str,
+    dry_run: bool,
+    inbox_scrolls: int,
+    wait_after_unread: float,
+    operation_delay_seconds: float,
+    switch_status: dict[str, Any] | None,
+    switch_job: dict[str, Any] | None,
+    switch_unread: dict[str, Any] | None,
+    inbox: dict[str, Any] | None,
+    conversations: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    reason: str = "",
+) -> dict[str, Any]:
+    success_count = sum(1 for item in results if item.get("success"))
+    skipped_count = sum(1 for item in results if item.get("skipped"))
+    failed_count = sum(
+        1 for item in results
+        if not dry_run and not item.get("success") and not item.get("skipped")
+    )
+    return {
+        "jobText": job_text,
+        "message": message,
+        "dryRun": dry_run,
+        "inboxScrolls": inbox_scrolls,
+        "waitAfterUnread": wait_after_unread,
+        "operationDelaySeconds": operation_delay_seconds,
+        "switchStatusTab": switch_status,
+        "switchJobFilter": switch_job,
+        "switchUnreadFilter": switch_unread,
+        "inbox": inbox,
+        "snapshotCount": len(conversations),
+        "processedCount": len(results),
+        "successCount": success_count,
+        "skippedCount": skipped_count,
+        "failedCount": failed_count,
+        "reason": reason,
+        "results": results,
+    }
 
 
 def _send_unread_message(

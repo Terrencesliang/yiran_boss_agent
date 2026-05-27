@@ -670,6 +670,205 @@ class ChromeDebugClient:
 
         return json.loads(response["result"]["result"]["value"])
 
+    def switch_conversation_status_tab(self, label: str, url_contains: str | None = None) -> dict[str, Any]:
+        if self.mock_dir is not None:
+            return {
+                "switched": True,
+                "label": label,
+                "matchedText": f"{label}(45)" if label == "\u65b0\u62db\u547c" else label,
+                "selector": ".chat-message-status span",
+            }
+
+        pages = self.list_pages()
+        page = self._select_page(pages, url_contains=url_contains)
+        websocket_url = page.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise ValueError("Selected page does not have webSocketDebuggerUrl")
+
+        escaped_label = json.dumps(label, ensure_ascii=False)
+        expression = f"""
+(() => {{
+  const text = (node) => node ? (node.innerText || '').trim() : '';
+  const isVisible = (el) => {{
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none';
+  }};
+  const normalize = (value) => String(value || '').replace(/\\s+/g, '').replace(/[（(]\\d+[）)]/g, '');
+  const targetLabel = normalize({escaped_label});
+  const candidates = Array.from(document.querySelectorAll(
+    '.chat-message-status span, .chat-message-status a, .chat-message-status li, .chat-status span, .chat-status a, .chat-status li, .chat-tab span, .chat-tab a, .chat-tab li, span, a, li'
+  )).filter(isVisible);
+  const target = candidates.find((el) => normalize(text(el)) === targetLabel);
+  if (!target) {{
+    return JSON.stringify({{
+      switched: false,
+      label: {escaped_label},
+      selector: '.chat-message-status span',
+      reason: 'not_found',
+      visibleTabs: candidates.map((el) => text(el)).filter(Boolean).slice(0, 40)
+    }});
+  }}
+  target.click();
+  return JSON.stringify({{
+    switched: true,
+    label: {escaped_label},
+    matchedText: text(target),
+    selector: '.chat-message-status span'
+  }});
+}})()
+""".strip()
+
+        ws = create_connection(websocket_url, timeout=5)
+        try:
+            response = self._send_cdp_command(
+                ws,
+                method="Runtime.evaluate",
+                params={"expression": expression, "returnByValue": True},
+            )
+        finally:
+            ws.close()
+
+        return json.loads(response["result"]["result"]["value"])
+
+    def click_request_resume_button(self, url_contains: str | None = None) -> dict[str, Any]:
+        if self.mock_dir is not None:
+            fixture = self.mock_dir / "request_resume_button.json"
+            if fixture.exists():
+                return json.loads(fixture.read_text(encoding="utf-8"))
+            return {
+                "clicked": True,
+                "selector": ".conversation-editor",
+                "text": "\u6c42\u7b80\u5386",
+            }
+
+        pages = self.list_pages()
+        page = self._select_page(pages, url_contains=url_contains)
+        websocket_url = page.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise ValueError("Selected page does not have webSocketDebuggerUrl")
+
+        expression = """
+(() => {
+  const text = (node) => node ? (node.innerText || node.textContent || '').trim() : '';
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none';
+  };
+  const root = document.querySelector('.conversation-operate')
+    || document.querySelector('.chat-conversation, .conversation, .chat-main, .chat-container')
+    || document;
+  const candidates = Array.from(root.querySelectorAll('button, a, span, div, [role="button"]'))
+    .filter((el) => isVisible(el) && text(el) === '求简历');
+  const target = candidates[0];
+  if (!target) {
+    return JSON.stringify({
+      clicked: false,
+      selector: '.conversation-editor',
+      text: '求简历',
+      reason: 'not_found',
+      visibleButtons: Array.from(root.querySelectorAll('button, a, [role="button"], span'))
+        .filter(isVisible)
+        .map((el) => text(el))
+        .filter(Boolean)
+        .slice(0, 40)
+    });
+  }
+  const rect = target.getBoundingClientRect();
+  const payload = {
+    clicked: true,
+    selector: '.conversation-editor',
+    text: text(target),
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2
+  };
+  target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: payload.x, clientY: payload.y }));
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: payload.x, clientY: payload.y, button: 0 }));
+  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: payload.x, clientY: payload.y, button: 0 }));
+  target.click();
+  return JSON.stringify(payload);
+})()
+""".strip()
+
+        ws = create_connection(websocket_url, timeout=5)
+        try:
+            response = self._send_cdp_command(
+                ws,
+                method="Runtime.evaluate",
+                params={"expression": expression, "returnByValue": True},
+            )
+        finally:
+            ws.close()
+
+        payload = json.loads(response["result"]["result"]["value"])
+        if payload.get("clicked") and "x" in payload and "y" in payload:
+            self._dispatch_mouse_click(websocket_url, payload["x"], payload["y"])
+            confirm = self._click_request_resume_confirm(websocket_url)
+            payload["confirm"] = confirm
+        return payload
+
+    def _click_request_resume_confirm(self, websocket_url: str) -> dict[str, Any]:
+        expression = """
+(() => {
+  const text = (node) => node ? (node.innerText || node.textContent || '').trim() : '';
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none';
+  };
+  const tooltip = Array.from(document.querySelectorAll('.exchange-tooltip, .boss-popover, .popover, div'))
+    .find((el) => text(el).includes('确定向牛人索取简历吗'));
+  if (!tooltip) {
+    return JSON.stringify({ clicked: false, reason: 'confirm_not_visible' });
+  }
+  const target = Array.from(tooltip.querySelectorAll('button, a, span, div, [role="button"]'))
+    .filter((el) => isVisible(el) && text(el) === '确定')
+    .pop();
+  if (!target) {
+    const rect = tooltip.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      return JSON.stringify({
+        clicked: true,
+        text: '确定',
+        fallback: 'tooltip_rect',
+        x: rect.left + rect.width * 0.82,
+        y: rect.top + rect.height * 0.72
+      });
+    }
+    return JSON.stringify({ clicked: false, reason: 'confirm_button_not_found', text: text(tooltip) });
+  }
+  const rect = target.getBoundingClientRect();
+  return JSON.stringify({
+    clicked: true,
+    text: text(target),
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2
+  });
+})()
+""".strip()
+        deadline = time.time() + 3.0
+        latest: dict[str, Any] = {"clicked": False, "reason": "confirm_not_checked"}
+        while time.time() < deadline:
+            latest = self._evaluate_json(websocket_url, expression, timeout=5)
+            if latest.get("clicked") and "x" in latest and "y" in latest:
+                self._dispatch_mouse_click(websocket_url, latest["x"], latest["y"])
+                return latest
+            time.sleep(0.25)
+        return latest
+
     def capture_job_filter_options(self, url_contains: str | None = None) -> dict[str, Any]:
         if self.mock_dir is not None:
             return {
@@ -5528,7 +5727,7 @@ def build_capture_conversation_expression() -> str:
 
   const salary = isHrPage
     ? firstNonEmpty([
-        (sidebarText.match(/鏈熸湜锛?*?(\\d+-\\d+K)/) || [])[1] || '',
+        (sidebarText.match(/(\\d+\\s*-\\s*\\d+\\s*[kK])/i) || [])[1] || '',
         text('.salary'),
       ])
     : text('.salary');
