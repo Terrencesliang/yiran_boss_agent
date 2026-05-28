@@ -500,6 +500,98 @@ def test_action_request_resume_new_greetings_defaults_to_dry_run() -> None:
     assert payload["results"][0]["requestResume"] is None
 
 
+def test_action_reply_unread_with_knowledge_defaults_to_dry_run(tmp_path: Path) -> None:
+    knowledge_file = tmp_path / "reply_faq.txt"
+    knowledge_file.write_text(
+        "Q: 我可以把我的简历发给您看看吗？\n"
+        "A: 可以的，您直接发过来就好，我这边先看一下。\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        "action",
+        "reply-unread-with-knowledge",
+        "--mock-dir",
+        "tests/fixtures",
+        "--url-contains",
+        "/web/chat/index",
+        "--job-text",
+        "\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        "--knowledge-file",
+        str(knowledge_file),
+        "--max-count",
+        "1",
+        "--inbox-scrolls",
+        "5",
+        "--operation-delay-seconds",
+        "0",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["dryRun"] is True
+    assert payload["switchJobFilter"]["switched"] is True
+    assert payload["switchUnreadFilter"]["label"] == "\u672a\u8bfb"
+    assert payload["snapshotCount"] == 1
+    assert payload["processedCount"] == 1
+    assert payload["results"][0]["reply"] == "可以的，您直接发过来就好，我这边先看一下。"
+    assert payload["results"][0]["reason"] == "dry_run"
+    assert payload["results"][0]["send"] is None
+
+
+def test_action_reply_unread_with_knowledge_uses_routed_knowledge_dir(tmp_path: Path) -> None:
+    knowledge_dir = tmp_path / "knowledge"
+    faq_dir = knowledge_dir / "jobs" / "线上分销（美妆）" / "job"
+    faq_dir.mkdir(parents=True)
+    (faq_dir / "faq.txt").write_text(
+        "[常见问答]\n"
+        "Q: 我可以把我的简历发给您看看吗？\n"
+        "A: 可以的，您直接发过来就好，我这边先看一下。\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        "action",
+        "reply-unread-with-knowledge",
+        "--mock-dir",
+        "tests/fixtures",
+        "--url-contains",
+        "/web/chat/index",
+        "--job-text",
+        "文员 _ 珠海 5-6K",
+        "--knowledge-dir",
+        str(knowledge_dir),
+        "--max-count",
+        "1",
+        "--inbox-scrolls",
+        "5",
+        "--operation-delay-seconds",
+        "0",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["knowledgeMode"] == "routed_dir"
+    assert payload["results"][0]["reply"] == "可以的，您直接发过来就好，我这边先看一下。"
+    assert payload["results"][0]["matchedIntent"] == "job"
+    assert payload["results"][0]["jobFolder"] == "线上分销（美妆）"
+
+
+def test_recommend_detail_local_filters_accept_multiselect_values() -> None:
+    from boss_agent.cli import _recommend_detail_matches_local_filters_v2
+
+    combined = "候选人 26岁 本科 4年经验 14-18K"
+
+    assert _recommend_detail_matches_local_filters_v2(
+        combined,
+        {"学历": "大专,本科", "薪资": "10-13K,15-20K", "经验": "1-2年,3-5年"},
+    )
+    assert not _recommend_detail_matches_local_filters_v2(
+        combined,
+        {"学历": "硕士,博士"},
+    )
+
+
 def test_action_process_unread_with_fallback_today_processes_today_items_from_all() -> None:
     result = run_cli(
         "action",

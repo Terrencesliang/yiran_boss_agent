@@ -1274,7 +1274,7 @@ class ChromeDebugClient:
         self,
         job_title: str,
         city: str,
-        filters: dict[str, str] | None = None,
+        filters: dict[str, Any] | None = None,
         url_contains: str | None = "/web/chat/recommend",
         operation_delay_seconds: float = 0,
         max_filter_retries: int = 2,
@@ -1284,7 +1284,10 @@ class ChromeDebugClient:
             tasks = [
                 {
                     "rawKey": str(key),
-                    "rawValue": str(value),
+                    "rawValue": value,
+                    "expectedValues": self._split_filter_values(value),
+                    "clickedValues": self._split_filter_values(value),
+                    "missingValues": [],
                     "normalizedKey": self._normalize_recommend_filter_key(key),
                     "controlType": "mock",
                     "status": "verified",
@@ -1359,7 +1362,10 @@ class ChromeDebugClient:
             age_filter_tasks.append(
                 {
                     "rawKey": str(key),
-                    "rawValue": str(value),
+                    "rawValue": value,
+                    "expectedValues": self._split_filter_values(value),
+                    "clickedValues": [str(value)] if result.get("applied") else [],
+                    "missingValues": [] if result.get("applied") else [str(value)],
                     "normalizedKey": self._normalize_recommend_filter_key(key),
                     "controlType": result.get("method") or "slider",
                     "status": "verified" if result.get("verified") else ("unverified" if result.get("applied") else "missing"),
@@ -1442,7 +1448,7 @@ class ChromeDebugClient:
 
     @staticmethod
     def _recommend_failed_retry_filters(
-        raw_filters: dict[str, str],
+        raw_filters: dict[str, Any],
         payload: dict[str, Any],
     ) -> dict[str, str]:
         verification = payload.get("verification") or {}
@@ -1455,18 +1461,26 @@ class ChromeDebugClient:
             item = verification.get(key_text) or {}
             if (not item or not item.get("verified")) and key_text not in failed_keys:
                 failed_keys.append(key_text)
-        return {
-            key: value for key, value in raw_filters.items()
-            if str(key) in failed_keys
-        }
+        retry_filters: dict[str, Any] = {}
+        for key, value in raw_filters.items():
+            if str(key) not in failed_keys:
+                continue
+            item = verification.get(str(key)) or verification.get(key) or {}
+            missing_values = [
+                str(item_value)
+                for item_value in item.get("missingValues", [])
+                if str(item_value).strip()
+            ]
+            retry_filters[key] = ",".join(missing_values) if missing_values else value
+        return retry_filters
 
     @classmethod
     def _merge_recommend_filter_retry_payloads(
         cls,
         base: dict[str, Any],
         retry: dict[str, Any],
-        raw_filters: dict[str, str],
-        retried_filters: dict[str, str],
+        raw_filters: dict[str, Any],
+        retried_filters: dict[str, Any],
         attempt: int,
     ) -> dict[str, Any]:
         merged = {**base, **retry}
@@ -1556,6 +1570,14 @@ class ChromeDebugClient:
         return result
 
     @staticmethod
+    def _split_filter_values(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            raw_items = [str(item) for item in value]
+        else:
+            raw_items = re.split(r"[,，、;；|/]|(?:\s+or\s+)|或", str(value or ""), flags=re.IGNORECASE)
+        return [item.strip() for item in raw_items if item.strip()]
+
+    @staticmethod
     def _normalize_recommend_filter_key(key: str) -> str:
         raw = str(key or "").strip().lower()
         aliases = {
@@ -1571,12 +1593,24 @@ class ChromeDebugClient:
             "active": "\u6d3b\u8dc3\u5ea6",
             "\u6d3b\u8dc3": "\u6d3b\u8dc3\u5ea6",
         }
+        aliases.update({
+            "薪资": "薪资待遇",
+            "薪资待遇": "薪资待遇",
+            "薪资待遇[单选]": "薪资待遇",
+            "经验": "经验要求",
+            "工作经验": "经验要求",
+            "经验要求": "经验要求",
+            "学历": "学历要求",
+            "学历要求": "学历要求",
+            "活跃": "活跃度",
+            "活跃度": "活跃度",
+        })
         return aliases.get(raw, str(key or "").strip())
 
     def _verify_recommend_result_filters(
         self,
         websocket_url: str,
-        filters: dict[str, str],
+        filters: dict[str, Any],
         sample_size: int = 8,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {}
@@ -1640,8 +1674,14 @@ class ChromeDebugClient:
                 if mismatches:
                     failed_filters.append({"key": key, "reason": "candidate_age_out_of_range", "mismatches": mismatches})
             elif any(label in normalized_key for label in ("\u5b66\u5386", "\u6559\u80b2")):
-                expected_level = self._normalize_education_level(expected)
-                if not expected_level:
+                expected_levels = [
+                    level for level in (
+                        self._normalize_education_level(value)
+                        for value in self._split_filter_values(expected)
+                    )
+                    if level
+                ]
+                if not expected_levels:
                     continue
                 mismatches = []
                 unknown = []
@@ -1651,7 +1691,7 @@ class ChromeDebugClient:
                     if not level:
                         unknown.append(item.get("candidateName") or item.get("cardIndex"))
                         continue
-                    if not self._education_meets(level, expected_level):
+                    if not any(self._education_meets(level, expected_level) for expected_level in expected_levels):
                         mismatches.append(
                             {
                                 "candidate": item.get("candidateName"),
@@ -1663,10 +1703,15 @@ class ChromeDebugClient:
                 if mismatches:
                     failed_filters.append({"key": key, "reason": "candidate_education_below_expected", "mismatches": mismatches})
             elif any(label in normalized_key for label in ("\u85aa\u8d44", "\u5f85\u9047")):
-                salary_range = self._parse_salary_range(expected)
-                if not salary_range:
+                salary_ranges = [
+                    salary_range for salary_range in (
+                        self._parse_salary_range(value)
+                        for value in self._split_filter_values(expected)
+                    )
+                    if salary_range
+                ]
+                if not salary_ranges:
                     continue
-                lower, upper = salary_range
                 mismatches = []
                 unknown = []
                 for item in candidates:
@@ -1676,7 +1721,7 @@ class ChromeDebugClient:
                         unknown.append(item.get("candidateName") or item.get("cardIndex"))
                         continue
                     item_lower, item_upper = parsed
-                    if item_upper < lower or item_lower > upper:
+                    if not any(item_upper >= lower and item_lower <= upper for lower, upper in salary_ranges):
                         mismatches.append(
                             {
                                 "candidate": item.get("candidateName"),
@@ -1688,10 +1733,15 @@ class ChromeDebugClient:
                 if mismatches:
                     failed_filters.append({"key": key, "reason": "candidate_salary_out_of_range", "mismatches": mismatches})
             elif any(label in normalized_key for label in ("\u7ecf\u9a8c", "\u5de5\u4f5c\u7ecf\u9a8c")):
-                experience_range = self._parse_experience_filter_range(expected)
-                if not experience_range:
+                experience_ranges = [
+                    experience_range for experience_range in (
+                        self._parse_experience_filter_range(value)
+                        for value in self._split_filter_values(expected)
+                    )
+                    if experience_range
+                ]
+                if not experience_ranges:
                     continue
-                lower, upper = experience_range
                 mismatches = []
                 unknown = []
                 for item in candidates:
@@ -1700,7 +1750,7 @@ class ChromeDebugClient:
                     if years is None:
                         unknown.append(item.get("candidateName") or item.get("cardIndex"))
                         continue
-                    if years < lower or years > upper:
+                    if not any(lower <= years <= upper for lower, upper in experience_ranges):
                         mismatches.append(
                             {
                                 "candidate": item.get("candidateName"),
@@ -3835,6 +3885,10 @@ def build_apply_recommend_filters_expression(
   const rootDocument = frame?.contentDocument || document;
   const rootWindow = rootDocument.defaultView || window;
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const optionClickDelayMs = actionDelayMs || 1000;
+  const waitAfterOptionClick = async () => {{
+    await delay(optionClickDelayMs);
+  }};
   const text = (el) => el ? (el.innerText || el.textContent || el.value || '').trim() : '';
   const isVisible = (el) => {{
     if (!el) return false;
@@ -3873,7 +3927,7 @@ def build_apply_recommend_filters_expression(
       .sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width)[0];
     if (!cancelButton) return {{ dismissed: false, reason: 'cancel_not_found' }};
     clickElement(cancelButton);
-    await delay(actionDelayMs || 300);
+      await delay(actionDelayMs || 1000);
     return {{ dismissed: true }};
   }};
   const openFilterPanel = async () => {{
@@ -3885,15 +3939,16 @@ def build_apply_recommend_filters_expression(
       .filter((el) => text(el).includes('\u7b5b\u9009'))
       .sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width)[0];
     if (!filterTrigger) return {{ opened: false, reason: 'filter_button_not_found' }};
+    await delay(1000);
     clickElement(filterTrigger);
-    await delay(actionDelayMs || 300);
+    await delay(actionDelayMs || 1000);
     await dismissLastFilterPrompt();
     return {{ opened: Boolean(rootDocument.querySelector('.filter-panel')), alreadyOpen: false }};
   }};
   const splitFilterValues = (value) => {{
     if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
     return String(value || '')
-      .split(/[,锛屻€亅]/)
+      .split(new RegExp('[,，、;；|/]|(?:\\\\s+or\\\\s+)|或', 'i'))
       .map((item) => item.trim())
       .filter(Boolean);
   }};
@@ -4024,16 +4079,16 @@ def build_apply_recommend_filters_expression(
     }}
     const clickTarget = target.closest('button, a, label, li, .option, .default, .operate-btn') || target;
     clickTarget.scrollIntoView?.({{ block: 'center', inline: 'center' }});
-    await delay(actionDelayMs || 120);
+    await waitAfterOptionClick();
     clickElement(clickTarget);
-    await delay(actionDelayMs || 450);
+    await waitAfterOptionClick();
     const group = scope || clickTarget.closest('.filter-item, .condition-item, .filter-wrap') || rootDocument;
     let selected = selectedTextsInGroup(group);
     let vueForced = null;
     if (!valuesVerifiedBySelected([value], selected)) {{
       vueForced = forceOptionViaVue(group, value);
       if (vueForced.applied) {{
-        await delay(actionDelayMs || 450);
+        await waitAfterOptionClick();
         selected = selectedTextsInGroup(group);
       }}
     }}
@@ -4073,7 +4128,8 @@ def build_apply_recommend_filters_expression(
       ...(parentVm?._props?.value || parentVm?.value || {{}})
     }};
     const multiple = checkboxVm?._props?.multiple !== false;
-    current[paramName] = multiple ? [code] : code;
+    const existing = Array.isArray(current[paramName]) ? current[paramName] : [];
+    current[paramName] = multiple ? [...new Set([...existing, code])] : code;
     try {{
       if (filterRootVm?._data) {{
         filterRootVm._data.checkedFilters = {{ ...(filterRootVm._data.checkedFilters || {{}}), ...current }};
@@ -4082,8 +4138,8 @@ def build_apply_recommend_filters_expression(
       }}
       parentVm?.$emit?.('change', current);
       try {{ parentVm?.change?.(current); }} catch (error) {{}}
-      optionVm.$forceUpdate?.();
-      checkboxVm.$forceUpdate?.();
+      optionVm?.$forceUpdate?.();
+      checkboxVm?.$forceUpdate?.();
       parentVm?.$forceUpdate?.();
       return {{
         applied: true,
@@ -4133,6 +4189,13 @@ def build_apply_recommend_filters_expression(
   const valuesVerifiedBySelected = (values, selectedTexts) => {{
     const normalizedSelected = (selectedTexts || []).map(normalizeComparable);
     return values.every((item) => {{
+      const wanted = normalizeComparable(item);
+      return normalizedSelected.some((actual) => actual === wanted || actual.includes(wanted) || wanted.includes(actual));
+    }});
+  }};
+  const matchingValuesBySelected = (values, selectedTexts) => {{
+    const normalizedSelected = (selectedTexts || []).map(normalizeComparable);
+    return (values || []).filter((item) => {{
       const wanted = normalizeComparable(item);
       return normalizedSelected.some((actual) => actual === wanted || actual.includes(wanted) || wanted.includes(actual));
     }});
@@ -4324,7 +4387,7 @@ def build_apply_recommend_filters_expression(
     if (!rootDocument.querySelector('.filter-panel') && filterTrigger) {{
       clickElement(filterTrigger);
     }}
-    await delay(actionDelayMs || 300);
+    await delay(actionDelayMs || 1000);
     const ageTrigger = visibleNodes('.filter-item.age, .filter-item, button, a, span, label, li, div')
       .find((el) => text(el) === '骞撮緞' || text(el).startsWith('骞撮緞\\n') || text(el).includes('骞撮緞'));
     if (!ageTrigger) return {{ applied: false, reason: 'age_trigger_not_found', filterOpened: Boolean(rootDocument.querySelector('.filter-panel')) }};
@@ -4333,7 +4396,7 @@ def build_apply_recommend_filters_expression(
     const inputResult = sliderResult.applied ? null : applyAgeInputs(range);
 
     const result = sliderResult.applied ? sliderResult : inputResult;
-    await delay(actionDelayMs || 300);
+    await delay(actionDelayMs || 1000);
     return {{
       ...result,
       min: range.min,
@@ -4385,7 +4448,7 @@ def build_apply_recommend_filters_expression(
       .sort((a, b) => (b.top - a.top) || (b.left - a.left) || (a.area - b.area))[0]?.el || null;
     if (exactConfirmButton) {{
       clickElement(exactConfirmButton);
-      await delay(actionDelayMs || 900);
+      await delay(actionDelayMs || 1000);
       if (!rootDocument.querySelector('.filter-panel')) {{
         return {{ clicked: true, method: 'dom_exact_button', panelClosed: true }};
       }}
@@ -4394,7 +4457,7 @@ def build_apply_recommend_filters_expression(
     if (rootVm?.confirm) {{
       try {{
         rootVm.confirm();
-        await delay(actionDelayMs || 1200);
+        await delay(actionDelayMs || 1000);
         return {{
           clicked: true,
           method: 'vue_confirm',
@@ -4478,11 +4541,17 @@ def build_apply_recommend_filters_expression(
     const missingValues = [];
     const selectedSnapshots = [];
     for (const item of values) {{
-      const firstClick = await clickOptionAndReadSelected(filterItem, item);
+      const selectedBefore = selectedTextsInGroup(filterItem || rootDocument);
+      const firstClick = valuesVerifiedBySelected([item], selectedBefore)
+        ? {{ clicked: true, selected: selectedBefore, alreadySelected: true }}
+        : await clickOptionAndReadSelected(filterItem, item);
       if (firstClick.clicked) {{
         let latestClick = firstClick;
         let retried = false;
-        if (!valuesVerifiedBySelected([item], firstClick.selected)) {{
+        if (firstClick.alreadySelected) {{
+          await waitAfterOptionClick();
+        }}
+        if (!firstClick.alreadySelected && !valuesVerifiedBySelected([item], firstClick.selected)) {{
           retried = true;
           latestClick = await clickOptionAndReadSelected(filterItem, item);
         }}
@@ -4491,6 +4560,7 @@ def build_apply_recommend_filters_expression(
           value: item,
           selected: latestClick.selected,
           firstSelected: firstClick.selected,
+          alreadySelected: Boolean(firstClick.alreadySelected),
           retried,
           vueForced: latestClick.vueForced || firstClick.vueForced || null,
           targetText: latestClick.targetText || firstClick.targetText || '',
@@ -4498,7 +4568,9 @@ def build_apply_recommend_filters_expression(
         }});
       }} else {{
         missingValues.push(item);
+        await waitAfterOptionClick();
       }}
+      await waitAfterOptionClick();
     }}
     const selectedAfterClick = selectedTextsInGroup(filterItem || rootDocument);
     specialFilters[key] = {{
@@ -4516,10 +4588,11 @@ def build_apply_recommend_filters_expression(
     }};
     if (task) {{
       task.controlType = 'options';
-      task.status = clickedValues.length > 0 ? 'clicked' : 'missing';
+      task.status = clickedValues.length === values.length ? 'clicked' : (clickedValues.length > 0 ? 'partial' : 'missing');
       task.evidence = clickedValues.length > 0 ? ['option_clicked'] : [];
       task.similarGroups = similar.groups;
       task.similarOptions = similar.options;
+      task.expectedValues = values;
       task.clickedValues = clickedValues;
       task.missingValues = missingValues;
       task.selectedAfterClick = selectedAfterClick;
@@ -4545,7 +4618,7 @@ def build_apply_recommend_filters_expression(
     : null;
   if (confirmButton) {{
     clickElement(confirmButton);
-    await delay(actionDelayMs || 800);
+    await delay(actionDelayMs || 1000);
   }}
   if (autoConfirm && rootDocument.querySelector('.filter-panel')) {{
     const exactConfirmButton = visibleNodes('.filter-panel button, .filter-panel a, .filter-panel .btn, .filter-panel span, .filter-panel div')
@@ -4557,7 +4630,7 @@ def build_apply_recommend_filters_expression(
       }})[0];
     if (exactConfirmButton) {{
       clickElement(exactConfirmButton);
-      await delay(actionDelayMs || 1200);
+      await delay(actionDelayMs || 1000);
     }}
   }}
   const confirmResult = autoConfirm && filterEntries.length > 0 && appliedFilters.length > 0
@@ -4580,6 +4653,15 @@ def build_apply_recommend_filters_expression(
     const verifiedBeforeConfirm = valueVerified(key, value, result, echoBeforeConfirm);
     const verifiedAfterConfirm = valueVerified(key, value, result, echoAfterConfirm);
     const verified = verifiedBeforeConfirm || verifiedAfterConfirm;
+    const expectedValues = splitFilterValues(value);
+    const verifiedValues = isAgeFilterKey(key)
+      ? (verified ? expectedValues : [])
+      : Array.from(new Set([
+          ...matchingValuesBySelected(expectedValues, result?.selectedAfterClick || []),
+          ...matchingValuesBySelected(expectedValues, result?.selectedBeforeConfirm || []),
+          ...matchingValuesBySelected(expectedValues, result?.selectedAfterConfirm || [])
+        ]));
+    const missingValues = expectedValues.filter((item) => !verifiedValues.includes(item));
     const task = filterTasks.find((item) => item.rawKey === key);
     const evidence = [];
     if (valuesVerifiedBySelected(splitFilterValues(value), result?.selectedAfterClick || [])) evidence.push('group_selected_after_click');
@@ -4587,17 +4669,23 @@ def build_apply_recommend_filters_expression(
     if (valuesVerifiedBySelected(splitFilterValues(value), result?.selectedAfterConfirm || [])) evidence.push('group_selected_after_confirm');
     if (verifiedBeforeConfirm && isAgeFilterKey(key)) evidence.push('age_echo_before_confirm');
     if (verifiedAfterConfirm && isAgeFilterKey(key)) evidence.push('age_echo_after_confirm');
-    if (verified) verifiedAppliedFilters.push(key);
+    if (verifiedValues.length > 0) verifiedAppliedFilters.push(key);
     if (task) {{
-      task.status = verified ? 'verified' : (result?.applied ? 'unverified' : 'missing');
+      task.status = verified ? 'verified' : (verifiedValues.length > 0 ? 'partial' : (result?.applied ? 'unverified' : 'missing'));
       task.evidence = [...new Set([...(task.evidence || []), ...evidence])];
       task.actual = result?.actual || result?.clickedValues || [];
+      task.expectedValues = expectedValues;
+      task.verifiedValues = verifiedValues;
+      task.missingValues = missingValues;
       task.verified = verified;
     }}
     verification[key] = {{
       applied: Boolean(result?.applied),
       verified,
       expected: value,
+      expectedValues,
+      verifiedValues,
+      missingValues,
       actual: result?.actual || result?.clickedValues || [],
       selectedAfterClick: result?.selectedAfterClick || [],
       selectedBeforeConfirm: result?.selectedBeforeConfirm || [],
@@ -4617,7 +4705,7 @@ def build_apply_recommend_filters_expression(
         .find((el) => isVisible(el) && /\u641c\u7d22|\u786e\u5b9a|\u786e\u8ba4|\u7b5b\u9009|\u5b8c\u6210/.test(text(el)))
     : null;
   if (searchButton) clickElement(searchButton);
-  await delay(actionDelayMs || 500);
+  await delay(actionDelayMs || 1000);
   return JSON.stringify({{
     searched: Boolean(searchButton),
     skippedSearch: !shouldSearch,

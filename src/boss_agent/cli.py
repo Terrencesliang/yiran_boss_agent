@@ -20,6 +20,9 @@ from boss_agent.drafting import draft_reply
 from boss_agent.recommendation import score_recommendation
 from boss_agent.resume_agent import analyze_resume_against_criteria
 from boss_agent.scoring import score_conversation
+from boss_agent.knowledge_base import answer_question_from_knowledge_detailed
+from boss_agent.knowledge_base import load_knowledge_base
+from boss_agent.knowledge_base import normalize_text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -167,6 +170,18 @@ def build_parser() -> argparse.ArgumentParser:
     request_resume_parser.add_argument("--wait-after-unread", type=float, default=3.0)
     request_resume_parser.add_argument("--operation-delay-seconds", type=float, default=2.0)
     request_resume_parser.add_argument("--send", action="store_true")
+
+    knowledge_reply_parser = action_subparsers.add_parser("reply-unread-with-knowledge")
+    knowledge_reply_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
+    knowledge_reply_parser.add_argument("--mock-dir")
+    knowledge_reply_parser.add_argument("--url-contains", default="/web/chat/index")
+    knowledge_reply_parser.add_argument("--job-text", required=True)
+    knowledge_reply_parser.add_argument("--knowledge-dir", default=str((Path.cwd() / "knowledge").resolve()))
+    knowledge_reply_parser.add_argument("--knowledge-file")
+    knowledge_reply_parser.add_argument("--max-count", type=int, default=50)
+    knowledge_reply_parser.add_argument("--inbox-scrolls", type=int, default=20)
+    knowledge_reply_parser.add_argument("--operation-delay-seconds", type=float, default=2.0)
+    knowledge_reply_parser.add_argument("--send", action="store_true")
 
     process_all_today_parser = action_subparsers.add_parser("process-all-today")
     process_all_today_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
@@ -533,6 +548,22 @@ def main(argv: list[str] | None = None) -> int:
                     max_count=args.max_count,
                     inbox_scrolls=args.inbox_scrolls,
                     wait_after_unread=args.wait_after_unread,
+                    operation_delay_seconds=args.operation_delay_seconds,
+                    send=args.send,
+                )
+            )
+        if args.action_command == "reply-unread-with-knowledge":
+            fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
+            client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
+            return _print_json(
+                _reply_unread_with_knowledge(
+                    client=client,
+                    url_contains=args.url_contains,
+                    job_text=args.job_text,
+                    knowledge_dir=Path(args.knowledge_dir),
+                    knowledge_file=Path(args.knowledge_file) if args.knowledge_file else None,
+                    max_count=args.max_count,
+                    inbox_scrolls=args.inbox_scrolls,
                     operation_delay_seconds=args.operation_delay_seconds,
                     send=args.send,
                 )
@@ -1332,7 +1363,7 @@ def _click_recommend_card_greet_with_retries(
 def _recommend_detail_matches_local_filters(
     candidate: dict[str, Any],
     resume: dict[str, Any],
-    filters: dict[str, str],
+    filters: dict[str, Any],
 ) -> bool:
     combined = " ".join(
         str(value)
@@ -1350,29 +1381,37 @@ def _recommend_detail_matches_local_filters(
     return _recommend_detail_matches_local_filters_v2(combined, filters)
 
 
-def _recommend_detail_matches_local_filters_v2(combined: str, filters: dict[str, str]) -> bool:
+def _recommend_detail_matches_local_filters_v2(combined: str, filters: dict[str, Any]) -> bool:
     for key, value in filters.items():
         normalized_key = str(key)
-        normalized_value = str(value)
+        normalized_values = _split_filter_values(value)
         if any(label in normalized_key for label in ("学历", "学历要求", "教育")):
-            if normalized_value and normalized_value not in combined:
+            if normalized_values and not any(item in combined for item in normalized_values):
                 return False
         elif any(label in normalized_key for label in ("年龄", "年纪", "age")):
-            age_range = _parse_numeric_range(normalized_value)
+            age_ranges = [item for item in (_parse_numeric_range(raw) for raw in normalized_values) if item]
             age = _first_int_matching(combined, r"(\d{1,2})\s*岁")
-            if age_range and (age is None or not (age_range[0] <= age <= age_range[1])):
+            if age_ranges and (age is None or not any(lower <= age <= upper for lower, upper in age_ranges)):
                 return False
         elif any(label in normalized_key for label in ("薪资", "薪资待遇", "待遇")):
-            target_range = _parse_numeric_range(normalized_value)
+            target_ranges = [item for item in (_parse_numeric_range(raw) for raw in normalized_values) if item]
             salary_range = _parse_salary_range(combined)
-            if target_range and salary_range and not _ranges_overlap(target_range, salary_range):
+            if target_ranges and salary_range and not any(_ranges_overlap(target_range, salary_range) for target_range in target_ranges):
                 return False
         elif any(label in normalized_key for label in ("\u7ecf\u9a8c", "\u5de5\u4f5c\u7ecf\u9a8c")):
-            target_range = _parse_numeric_range(normalized_value)
+            target_ranges = [item for item in (_parse_numeric_range(raw) for raw in normalized_values) if item]
             work_years = _first_int_matching(combined, r"(\d{1,2})\s*\u5e74")
-            if target_range and work_years is not None and not (target_range[0] <= work_years <= target_range[1]):
+            if target_ranges and work_years is not None and not any(lower <= work_years <= upper for lower, upper in target_ranges):
                 return False
     return True
+
+
+def _split_filter_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = re.split(r"[,，、;；|/]|(?:\s+or\s+)|或", str(value or ""), flags=re.IGNORECASE)
+    return [item.strip() for item in raw_items if item.strip()]
 
 
 def _parse_numeric_range(value: str) -> tuple[int, int] | None:
@@ -1970,6 +2009,403 @@ def _request_resume_new_greetings_payload(
         "waitAfterUnread": wait_after_unread,
         "operationDelaySeconds": operation_delay_seconds,
         "switchStatusTab": switch_status,
+        "switchJobFilter": switch_job,
+        "switchUnreadFilter": switch_unread,
+        "inbox": inbox,
+        "snapshotCount": len(conversations),
+        "processedCount": len(results),
+        "successCount": success_count,
+        "skippedCount": skipped_count,
+        "failedCount": failed_count,
+        "reason": reason,
+        "results": results,
+    }
+
+
+def _reply_unread_with_knowledge(
+    client: ChromeDebugClient,
+    url_contains: str,
+    job_text: str,
+    max_count: int,
+    inbox_scrolls: int,
+    operation_delay_seconds: float,
+    send: bool,
+    knowledge_dir: Path | None = None,
+    knowledge_file: Path | None = None,
+) -> dict[str, Any]:
+    dry_run = not send
+    legacy_knowledge = _load_reply_knowledge_file(knowledge_file) if knowledge_file else None
+    knowledge = load_knowledge_base(knowledge_dir) if knowledge_dir and knowledge_dir.exists() else None
+    switch_job = client.switch_job_filter(job_text=job_text, url_contains=url_contains)
+    if not switch_job.get("switched"):
+        return _reply_unread_with_knowledge_payload(
+            job_text=job_text,
+            knowledge_file=knowledge_file,
+            knowledge_dir=knowledge_dir,
+            dry_run=dry_run,
+            inbox_scrolls=inbox_scrolls,
+            operation_delay_seconds=operation_delay_seconds,
+            switch_job=switch_job,
+            switch_unread=None,
+            inbox=None,
+            conversations=[],
+            results=[],
+            reason="job_filter_not_switched",
+        )
+    _sleep_operation_delay(operation_delay_seconds)
+
+    switch_unread = client.switch_message_filter(label="\u672a\u8bfb", url_contains=url_contains)
+    _sleep_operation_delay(operation_delay_seconds)
+    inbox = client.capture_unread_inbox_scrolled(
+        url_contains=url_contains,
+        max_items=max_count,
+        max_scrolls=inbox_scrolls,
+    )
+    conversations = [item for item in inbox.get("conversations", []) if item.get("dataId")][:max_count]
+    results: list[dict[str, Any]] = []
+
+    for item in conversations:
+        open_result = None
+        readiness = None
+        fill_result = None
+        send_result = None
+        if dry_run:
+            latest_message = str(item.get("summary") or "")
+            latest_direction = "inbound" if latest_message else ""
+            match = _match_unread_knowledge(
+                latest_message=latest_message,
+                latest_direction=latest_direction,
+                job_title=str(item.get("jobTitle") or job_text),
+                knowledge=knowledge,
+                legacy_knowledge=legacy_knowledge,
+            )
+            skipped = match is None
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": None,
+                    "conversationReady": None,
+                    "latestMessage": latest_message,
+                    "latestDirection": latest_direction,
+                    "matchedFaq": match.get("question") if match else "",
+                    "matchedIntent": match.get("intent") if match else "",
+                    "jobFolder": match.get("jobFolder") if match else "",
+                    "knowledgeReason": match.get("reason") if match else "knowledge_not_matched",
+                    "reply": match.get("answer") if match else "",
+                    "fill": None,
+                    "send": None,
+                    "success": False,
+                    "skipped": skipped,
+                    "reason": "knowledge_not_matched" if skipped else "dry_run",
+                }
+            )
+            _sleep_operation_delay(operation_delay_seconds)
+            continue
+
+        open_result = client.open_conversation(
+            data_id=item.get("dataId"),
+            candidate_name=item.get("candidateName"),
+            url_contains=url_contains,
+            max_scrolls=inbox_scrolls,
+        )
+        _sleep_operation_delay(operation_delay_seconds)
+        readiness = client.wait_for_conversation_ready(
+            expected_candidate_name=item.get("candidateName"),
+            expected_job_title=item.get("jobTitle"),
+            url_contains=url_contains,
+        )
+        if not readiness.get("ready"):
+            results.append(
+                _reply_unread_result(
+                    target=item,
+                    open_result=open_result,
+                    readiness=readiness,
+                    reason="conversation_not_ready",
+                    skipped=True,
+                )
+            )
+            continue
+
+        conversation = readiness.get("conversation", {})
+        latest = _latest_business_message(conversation)
+        latest_text = str(latest.get("text") or "")
+        latest_direction = str(latest.get("direction") or "")
+        if latest_direction != "inbound":
+            results.append(
+                _reply_unread_result(
+                    target=item,
+                    open_result=open_result,
+                    readiness=readiness,
+                    latest_message=latest_text,
+                    latest_direction=latest_direction,
+                    reason="latest_message_not_inbound",
+                    skipped=True,
+                )
+            )
+            continue
+
+        match = _match_unread_knowledge(
+            latest_message=latest_text,
+            latest_direction=latest_direction,
+            job_title=str(conversation.get("jobTitle") or item.get("jobTitle") or job_text),
+            knowledge=knowledge,
+            legacy_knowledge=legacy_knowledge,
+        )
+        if match is None:
+            results.append(
+                _reply_unread_result(
+                    target=item,
+                    open_result=open_result,
+                    readiness=readiness,
+                    latest_message=latest_text,
+                    latest_direction=latest_direction,
+                    reason="knowledge_not_matched",
+                    skipped=True,
+                )
+            )
+            continue
+
+        fill_result = client.fill_chat_input(match["answer"], url_contains=url_contains)
+        _sleep_operation_delay(operation_delay_seconds)
+        reason = ""
+        if fill_result.get("filled"):
+            send_result = client.send_current_message(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            if not send_result.get("sent"):
+                reason = str(send_result.get("reason") or "send_failed")
+        else:
+            reason = str(fill_result.get("reason") or "fill_failed")
+        success = bool(send_result and send_result.get("sent"))
+        results.append(
+            _reply_unread_result(
+                target=item,
+                open_result=open_result,
+                readiness=readiness,
+                latest_message=latest_text,
+                latest_direction=latest_direction,
+                matched_question=match["question"],
+                matched_intent=match.get("intent", ""),
+                job_folder=match.get("jobFolder", ""),
+                knowledge_reason=match.get("reason", "matched"),
+                reply=match["answer"],
+                fill=fill_result,
+                send_result=send_result,
+                success=success,
+                skipped=False,
+                reason="" if success else reason,
+            )
+        )
+
+    return _reply_unread_with_knowledge_payload(
+        job_text=job_text,
+        knowledge_file=knowledge_file,
+        knowledge_dir=knowledge_dir,
+        dry_run=dry_run,
+        inbox_scrolls=inbox_scrolls,
+        operation_delay_seconds=operation_delay_seconds,
+        switch_job=switch_job,
+        switch_unread=switch_unread,
+        inbox=inbox,
+        conversations=conversations,
+        results=results,
+    )
+
+
+def _load_reply_knowledge_file(path: Path) -> dict[str, Any]:
+    content = path.read_text(encoding="utf-8")
+    fallback = ""
+    fallback_match = re.search(r"(?s)\[兜底回复\]\s*(.+?)(?=\n\[|$)", content)
+    if fallback_match:
+        fallback = fallback_match.group(1).strip()
+    faq = _parse_reply_faq_text(content)
+    return {"faq": faq, "fallback": fallback}
+
+
+def _parse_reply_faq_text(content: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    question = ""
+    answer_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal question, answer_lines
+        if question and answer_lines:
+            items.append({"question": question, "answer": "\n".join(answer_lines).strip()})
+        question = ""
+        answer_lines = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
+            continue
+        if re.match(r"^[Qq]\s*[:：]", line):
+            flush()
+            question = re.sub(r"^[Qq]\s*[:：]\s*", "", line).strip()
+        elif re.match(r"^[Aa]\s*[:：]", line):
+            answer_lines.append(re.sub(r"^[Aa]\s*[:：]\s*", "", line).strip())
+        elif question:
+            answer_lines.append(line)
+
+    flush()
+    return [item for item in items if item["question"] and item["answer"]]
+
+
+def _match_reply_knowledge(message: str, faq_items: list[dict[str, str]]) -> dict[str, str] | None:
+    query = normalize_text(message)
+    if not query:
+        return None
+    query_tokens = _reply_match_tokens(query)
+    if not query_tokens:
+        return None
+    for item in faq_items:
+        question = normalize_text(item.get("question", ""))
+        answer = item.get("answer", "")
+        if not question or not answer:
+            continue
+        question_tokens = _reply_match_tokens(question)
+        if not question_tokens:
+            continue
+        if question in query or query in question:
+            return {"question": item.get("question", ""), "answer": answer}
+
+    best_item: dict[str, str] | None = None
+    best_score = 0
+    for item in faq_items:
+        question_tokens = _reply_match_tokens(normalize_text(item.get("question", "")))
+        if not question_tokens:
+            continue
+        score = len(query_tokens & question_tokens)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item and best_score >= 2:
+        return {"question": best_item.get("question", ""), "answer": best_item.get("answer", "")}
+    return None
+
+
+def _match_unread_knowledge(
+    latest_message: str,
+    latest_direction: str,
+    job_title: str,
+    knowledge: dict[str, Any] | None,
+    legacy_knowledge: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if latest_direction != "inbound":
+        return None
+    if legacy_knowledge is not None:
+        match = _match_reply_knowledge(latest_message, legacy_knowledge["faq"])
+        if not match:
+            return None
+        return {
+            "question": match["question"],
+            "answer": match["answer"],
+            "intent": "legacy",
+            "jobFolder": "",
+            "reason": "matched",
+        }
+    if knowledge is None:
+        return None
+
+    qa_result = answer_question_from_knowledge_detailed(
+        {
+            "jobTitle": job_title,
+            "messages": [{"direction": "inbound", "text": latest_message}],
+        },
+        knowledge,
+    )
+    if not qa_result.get("answer"):
+        return None
+    matches = qa_result.get("matches", [])
+    return {
+        "question": " / ".join(str(item.get("question", "")) for item in matches if item.get("question")),
+        "answer": str(qa_result.get("answer") or ""),
+        "intent": ",".join(str(item.get("intent", "")) for item in matches if item.get("intent")),
+        "jobFolder": str(qa_result.get("jobFolder") or ""),
+        "reason": str(qa_result.get("reason") or "matched"),
+    }
+
+
+def _reply_match_tokens(text: str) -> set[str]:
+    chunks = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]+", text)
+    tokens: set[str] = set()
+    for chunk in chunks:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", chunk):
+            tokens.update(chunk[index:index + 2] for index in range(max(0, len(chunk) - 1)))
+        else:
+            tokens.add(chunk.lower())
+    return tokens
+
+
+def _latest_business_message(conversation: dict[str, Any]) -> dict[str, Any]:
+    for message in reversed(conversation.get("messages", [])):
+        if message.get("direction") in {"inbound", "outbound"}:
+            return message
+    return {}
+
+
+def _reply_unread_result(
+    target: dict[str, Any],
+    open_result: dict[str, Any] | None,
+    readiness: dict[str, Any] | None,
+    latest_message: str = "",
+    latest_direction: str = "",
+    matched_question: str = "",
+    matched_intent: str = "",
+    job_folder: str = "",
+    knowledge_reason: str = "",
+    reply: str = "",
+    fill: dict[str, Any] | None = None,
+    send_result: dict[str, Any] | None = None,
+    success: bool = False,
+    skipped: bool = False,
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "target": target,
+        "openConversation": open_result,
+        "conversationReady": readiness,
+        "latestMessage": latest_message,
+        "latestDirection": latest_direction,
+        "matchedFaq": matched_question,
+        "matchedIntent": matched_intent,
+        "jobFolder": job_folder,
+        "knowledgeReason": knowledge_reason,
+        "reply": reply,
+        "fill": fill,
+        "send": send_result,
+        "success": success,
+        "skipped": skipped,
+        "reason": reason,
+    }
+
+
+def _reply_unread_with_knowledge_payload(
+    job_text: str,
+    knowledge_file: Path | None,
+    knowledge_dir: Path | None,
+    dry_run: bool,
+    inbox_scrolls: int,
+    operation_delay_seconds: float,
+    switch_job: dict[str, Any] | None,
+    switch_unread: dict[str, Any] | None,
+    inbox: dict[str, Any] | None,
+    conversations: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    reason: str = "",
+) -> dict[str, Any]:
+    success_count = sum(1 for item in results if item.get("success"))
+    skipped_count = sum(1 for item in results if item.get("skipped"))
+    failed_count = sum(
+        1 for item in results
+        if not dry_run and not item.get("success") and not item.get("skipped")
+    )
+    return {
+        "jobText": job_text,
+        "knowledgeFile": str(knowledge_file) if knowledge_file else "",
+        "knowledgeDir": str(knowledge_dir) if knowledge_dir else "",
+        "knowledgeMode": "legacy_file" if knowledge_file else "routed_dir",
+        "dryRun": dry_run,
+        "inboxScrolls": inbox_scrolls,
+        "operationDelaySeconds": operation_delay_seconds,
         "switchJobFilter": switch_job,
         "switchUnreadFilter": switch_unread,
         "inbox": inbox,

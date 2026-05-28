@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from boss_agent.knowledge_base import answer_question_from_knowledge
+from boss_agent.knowledge_base import answer_question_from_knowledge_detailed
 from boss_agent.knowledge_base import load_knowledge_base
 from boss_agent.knowledge_base import suggest_follow_up_question
 from boss_agent.knowledge_base import summarize_job_from_knowledge
@@ -43,7 +43,8 @@ def draft_reply(
     follow_up_prompt: str | None = None
     if knowledge_dir and knowledge_dir.exists():
         knowledge = load_knowledge_base(knowledge_dir)
-        knowledge_answer = answer_question_from_knowledge(conversation, knowledge)
+        knowledge_answer_result = answer_question_from_knowledge_detailed(conversation, knowledge)
+        knowledge_answer = knowledge_answer_result.get("answer")
         knowledge_summary = summarize_job_from_knowledge(conversation, knowledge)
         follow_up_prompt = suggest_follow_up_question(conversation, knowledge)
 

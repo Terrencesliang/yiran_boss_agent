@@ -14,10 +14,12 @@ from boss_agent.chrome_debug import build_chrome_launch_command
 from boss_agent.chrome_debug import classify_page
 from boss_agent.cli import _load_screen_recommend_detail_config
 from boss_agent.cli import _format_keyword_evidence
+from boss_agent.cli import _reply_unread_with_knowledge
 from boss_agent.cli import _request_resume_new_greetings
 from boss_agent.cli import _screen_recommend_detail
 from boss_agent.drafting import draft_reply
 from boss_agent.knowledge_base import answer_question_from_knowledge
+from boss_agent.knowledge_base import answer_question_from_knowledge_detailed
 from boss_agent.knowledge_base import load_knowledge_base
 from boss_agent.knowledge_base import suggest_follow_up_question
 from boss_agent.knowledge_base import summarize_job_from_knowledge
@@ -290,7 +292,7 @@ def test_answer_question_from_knowledge_matches_job_faq() -> None:
     assert answer == "这个岗位目前还在招聘。"
 
 
-def test_answer_question_from_knowledge_requires_exact_job_title_match() -> None:
+def test_answer_question_from_knowledge_matches_exact_file_name_before_aliases() -> None:
     knowledge = load_knowledge_base(FIXTURES / "knowledge")
     conversation = {
         "jobTitle": "电商运营经理（美妆）",
@@ -301,7 +303,119 @@ def test_answer_question_from_knowledge_requires_exact_job_title_match() -> None
 
     answer = answer_question_from_knowledge(conversation, knowledge)
 
-    assert answer is None
+    assert answer == "这个岗位目前还在招聘。"
+
+
+def _write_routed_knowledge(tmp_path: Path) -> Path:
+    base = tmp_path / "knowledge"
+    job_root = base / "jobs" / "电商运营经理"
+    (base / "global" / "company").mkdir(parents=True)
+    for category in ("company", "job", "compensation", "department"):
+        (job_root / category).mkdir(parents=True)
+
+    (base / "global" / "company" / "company.txt").write_text(
+        "[常见问答]\n"
+        "Q: 公司是做什么的？\n"
+        "A: 公司主要做美妆电商业务。\n"
+        "Q: 公司氛围怎么样？\n"
+        "A: 公司整体氛围年轻直接。\n",
+        encoding="utf-8",
+    )
+    (job_root / "company" / "company.txt").write_text(
+        "[常见问答]\n"
+        "Q: 公司氛围怎么样？\n"
+        "A: 这个岗位所在团队节奏清晰，协作比较直接。\n",
+        encoding="utf-8",
+    )
+    (job_root / "job" / "job.txt").write_text(
+        "[岗位名称]\n电商运营经理\n\n"
+        "[岗位职责]\n1、统筹天猫、京东、小红书等平台运营。\n\n"
+        "[常见问答]\n"
+        "Q: 这个岗位还在招吗？\n"
+        "A: 这个岗位目前还在招聘。\n",
+        encoding="utf-8",
+    )
+    (job_root / "compensation" / "salary.txt").write_text(
+        "[常见问答]\n"
+        "Q: 薪资范围是多少？\n"
+        "A: 薪资范围是 20k-28k，具体结合经验评估。\n",
+        encoding="utf-8",
+    )
+    (job_root / "department" / "org.txt").write_text(
+        "[常见问答]\n"
+        "Q: 部门架构是怎样的？\n"
+        "A: 部门分为运营、投放和内容协作小组。\n",
+        encoding="utf-8",
+    )
+    return base
+
+
+def test_routed_knowledge_answers_compensation_and_department(tmp_path: Path) -> None:
+    knowledge = load_knowledge_base(_write_routed_knowledge(tmp_path))
+    conversation = {
+        "jobTitle": "电商运营经理",
+        "messages": [
+            {"direction": "inbound", "text": "这个岗位薪资范围是多少，部门架构是怎样的？"},
+        ],
+    }
+
+    result = answer_question_from_knowledge_detailed(conversation, knowledge)
+
+    assert result["reason"] == "matched"
+    assert set(result["intents"]) == {"compensation", "department"}
+    assert result["jobFolder"] == "电商运营经理"
+    assert "20k-28k" in result["answer"]
+    assert "运营、投放和内容协作小组" in result["answer"]
+
+
+def test_routed_knowledge_company_prefers_job_folder_then_global(tmp_path: Path) -> None:
+    knowledge = load_knowledge_base(_write_routed_knowledge(tmp_path))
+    job_company = {
+        "jobTitle": "电商运营经理",
+        "messages": [{"direction": "inbound", "text": "公司氛围怎么样？"}],
+    }
+    global_company = {
+        "jobTitle": "电商运营经理",
+        "messages": [{"direction": "inbound", "text": "公司是做什么的？"}],
+    }
+
+    assert answer_question_from_knowledge(job_company, knowledge) == "这个岗位所在团队节奏清晰，协作比较直接。"
+    assert answer_question_from_knowledge(global_company, knowledge) == "公司主要做美妆电商业务。"
+
+
+def test_routed_knowledge_does_not_cross_job_for_salary(tmp_path: Path) -> None:
+    base = _write_routed_knowledge(tmp_path)
+    knowledge = load_knowledge_base(base)
+    conversation = {
+        "jobTitle": "不存在岗位",
+        "messages": [{"direction": "inbound", "text": "薪资范围是多少？"}],
+    }
+
+    result = answer_question_from_knowledge_detailed(conversation, knowledge)
+
+    assert result["answer"] is None
+    assert result["reason"] == "job_not_matched"
+
+
+def test_routed_knowledge_ambiguous_fuzzy_job_does_not_answer(tmp_path: Path) -> None:
+    base = tmp_path / "knowledge"
+    for folder in ("电商运营经理（美妆）", "电商运营经理（家电）"):
+        job_dir = base / "jobs" / folder / "compensation"
+        job_dir.mkdir(parents=True)
+        (job_dir / "salary.txt").write_text(
+            "[常见问答]\nQ: 薪资范围是多少？\nA: 薪资需要按具体岗位确认。\n",
+            encoding="utf-8",
+        )
+    knowledge = load_knowledge_base(base)
+    conversation = {
+        "jobTitle": "电商运营经理",
+        "messages": [{"direction": "inbound", "text": "薪资范围是多少？"}],
+    }
+
+    result = answer_question_from_knowledge_detailed(conversation, knowledge)
+
+    assert result["answer"] is None
+    assert result["reason"] == "job_not_matched"
 
 
 def test_answer_question_from_knowledge_matches_company_faq() -> None:
@@ -672,6 +786,167 @@ class RequestResumeFakeClient:
         return {"closed": True}
 
 
+class KnowledgeReplyFakeClient:
+    def __init__(
+        self,
+        *,
+        job_switched: bool = True,
+        latest_direction: str = "inbound",
+        latest_text: str = "\u8fd9\u4e2a\u5c97\u4f4d\u8fd8\u5728\u62db\u5417\uff1f",
+    ) -> None:
+        self.job_switched = job_switched
+        self.latest_direction = latest_direction
+        self.latest_text = latest_text
+        self.filled_messages = []
+
+    def switch_job_filter(self, job_text: str, url_contains=None) -> dict:
+        return {"switched": self.job_switched, "jobText": job_text, "selected": job_text if self.job_switched else ""}
+
+    def switch_message_filter(self, label: str, url_contains=None) -> dict:
+        return {"switched": True, "label": label}
+
+    def capture_unread_inbox_scrolled(
+        self,
+        url_contains=None,
+        max_items: int = 200,
+        max_scrolls: int = 20,
+    ) -> dict:
+        return {
+            "activeFilter": "\u672a\u8bfb",
+            "count": 1,
+            "scrollCapture": {"enabled": True, "maxItems": max_items, "maxScrolls": max_scrolls},
+            "conversations": [
+                {
+                    "dataId": "candidate-1",
+                    "candidateName": "\u674e\u5973\u58eb",
+                    "jobTitle": "\u6587\u5458 _ \u73e0\u6d77 5-6K",
+                    "summary": self.latest_text,
+                }
+            ],
+        }
+
+    def open_conversation(
+        self,
+        data_id=None,
+        candidate_name=None,
+        url_contains=None,
+        max_scrolls: int = 20,
+    ) -> dict:
+        return {"opened": True, "dataId": data_id, "candidateName": candidate_name}
+
+    def wait_for_conversation_ready(
+        self,
+        expected_candidate_name=None,
+        expected_job_title=None,
+        url_contains=None,
+    ) -> dict:
+        return {
+            "ready": True,
+            "conversation": {
+                "candidateName": expected_candidate_name,
+                "jobTitle": expected_job_title,
+                "messages": [{"direction": self.latest_direction, "text": self.latest_text}],
+            },
+        }
+
+    def fill_chat_input(self, body: str, url_contains=None) -> dict:
+        self.filled_messages.append(body)
+        return {"filled": True, "body": body}
+
+    def send_current_message(self, url_contains=None) -> dict:
+        return {"sent": True}
+
+
+def _write_reply_faq(tmp_path: Path) -> Path:
+    knowledge_file = tmp_path / "reply_faq.txt"
+    knowledge_file.write_text(
+        "Q: 这个岗位还在招吗？\n"
+        "A: 您好，这个岗位目前还在招聘，可以继续沟通。\n",
+        encoding="utf-8",
+    )
+    return knowledge_file
+
+
+def test_reply_unread_with_knowledge_send_fills_and_sends(tmp_path: Path) -> None:
+    client = KnowledgeReplyFakeClient()
+
+    result = _reply_unread_with_knowledge(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        knowledge_file=_write_reply_faq(tmp_path),
+        max_count=1,
+        inbox_scrolls=5,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["dryRun"] is False
+    assert result["successCount"] == 1
+    assert result["results"][0]["matchedFaq"] == "这个岗位还在招吗？"
+    assert result["results"][0]["reply"] == "您好，这个岗位目前还在招聘，可以继续沟通。"
+    assert result["results"][0]["send"]["sent"] is True
+    assert client.filled_messages == ["您好，这个岗位目前还在招聘，可以继续沟通。"]
+
+
+def test_reply_unread_with_knowledge_skips_unmatched_message(tmp_path: Path) -> None:
+    client = KnowledgeReplyFakeClient(latest_text="\u6211\u6709\u4e09\u5e74\u7ecf\u9a8c")
+
+    result = _reply_unread_with_knowledge(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        knowledge_file=_write_reply_faq(tmp_path),
+        max_count=1,
+        inbox_scrolls=5,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["successCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["results"][0]["reason"] == "knowledge_not_matched"
+    assert client.filled_messages == []
+
+
+def test_reply_unread_with_knowledge_skips_latest_outbound(tmp_path: Path) -> None:
+    client = KnowledgeReplyFakeClient(latest_direction="outbound")
+
+    result = _reply_unread_with_knowledge(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        knowledge_file=_write_reply_faq(tmp_path),
+        max_count=1,
+        inbox_scrolls=5,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["successCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["results"][0]["reason"] == "latest_message_not_inbound"
+
+
+def test_reply_unread_with_knowledge_stops_when_job_filter_fails(tmp_path: Path) -> None:
+    client = KnowledgeReplyFakeClient(job_switched=False)
+
+    result = _reply_unread_with_knowledge(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u4e0d\u5b58\u5728\u804c\u4f4d",
+        knowledge_file=_write_reply_faq(tmp_path),
+        max_count=1,
+        inbox_scrolls=5,
+        operation_delay_seconds=0,
+        send=True,
+    )
+
+    assert result["reason"] == "job_filter_not_switched"
+    assert result["snapshotCount"] == 0
+    assert result["processedCount"] == 0
+
+
 def test_request_resume_new_greetings_send_clicks_message_and_resume_button() -> None:
     client = RequestResumeFakeClient()
 
@@ -1008,6 +1283,67 @@ def test_apply_recommend_filters_tracks_verified_tasks_and_clicked_filters() -> 
     assert "panelScanAfter" in expression
 
 
+def test_apply_recommend_filters_expression_tracks_multiselect_partials() -> None:
+    expression = build_apply_recommend_filters_expression(
+        json.dumps(""),
+        json.dumps(""),
+        json.dumps(
+            {"学历": ["本科", "大专"], "薪资": "10-15K,15-20K"},
+            ensure_ascii=False,
+        ),
+    )
+
+    assert "matchingValuesBySelected" in expression
+    assert "verifiedValues" in expression
+    assert "missingValues" in expression
+    assert "'partial'" in expression
+    assert "alreadySelected" in expression
+
+
+def test_apply_recommend_filters_delays_each_multiselect_option_click() -> None:
+    expression = build_apply_recommend_filters_expression(
+        json.dumps(""),
+        json.dumps(""),
+        json.dumps({"学历": "本科,大专"}, ensure_ascii=False),
+        operation_delay_seconds=1,
+    )
+
+    assert "const optionClickDelayMs = actionDelayMs || 1000" in expression
+    assert "const waitAfterOptionClick = async" in expression
+    assert "await waitAfterOptionClick();" in expression
+
+
+def test_apply_recommend_filters_waits_before_opening_filter_panel() -> None:
+    expression = build_apply_recommend_filters_expression(
+        json.dumps(""),
+        json.dumps(""),
+        json.dumps({"学历": "本科"}, ensure_ascii=False),
+    )
+    open_panel_section = expression[
+        expression.index("const openFilterPanel = async")
+        : expression.index("const splitFilterValues =")
+    ]
+
+    assert "await delay(1000);" in open_panel_section
+    assert "clickElement(filterTrigger);" in open_panel_section
+
+
+def test_apply_recommend_filters_default_delays_are_one_second() -> None:
+    expression = build_apply_recommend_filters_expression(
+        json.dumps(""),
+        json.dumps(""),
+        json.dumps({"学历": "本科,大专"}, ensure_ascii=False),
+    )
+
+    assert "|| 300" not in expression
+    assert "|| 450" not in expression
+    assert "|| 500" not in expression
+    assert "|| 800" not in expression
+    assert "|| 900" not in expression
+    assert "|| 1200" not in expression
+    assert expression.count("|| 1000") >= 5
+
+
 def test_apply_recommend_filters_mock_returns_task_evidence() -> None:
     client = ChromeDebugClient(
         endpoint="http://127.0.0.1:9222",
@@ -1027,6 +1363,24 @@ def test_apply_recommend_filters_mock_returns_task_evidence() -> None:
     assert result["filterTasks"][0]["normalizedKey"] == "薪资待遇"
     assert result["filterTasks"][0]["status"] == "verified"
     assert result["filterTasks"][0]["evidence"] == ["mock"]
+
+
+def test_apply_recommend_filters_mock_records_multiselect_values() -> None:
+    client = ChromeDebugClient(
+        endpoint="http://127.0.0.1:9222",
+        mock_dir=FIXTURES,
+    )
+
+    result = client.apply_recommend_filters(
+        job_title="",
+        city="",
+        filters={"学历": ["本科", "大专"], "薪资": "10-15K,15-20K"},
+        url_contains="/web/chat/recommend",
+    )
+
+    assert result["filterTasks"][0]["expectedValues"] == ["本科", "大专"]
+    assert result["filterTasks"][0]["clickedValues"] == ["本科", "大专"]
+    assert result["filterTasks"][1]["expectedValues"] == ["10-15K", "15-20K"]
 
 
 def _age_slider_state(left: int, right: int) -> dict:
@@ -1672,6 +2026,27 @@ def test_apply_recommend_filters_retries_only_failed_filter() -> None:
     assert client.age_attempts == 2
     assert "10-20k" in client.expressions[0]
     assert "10-20k" not in client.expressions[1]
+
+
+def test_apply_recommend_filters_retries_only_missing_multiselect_values() -> None:
+    payload = {
+        "verification": {
+            "学历": {
+                "verified": False,
+                "verifiedValues": ["本科"],
+                "missingValues": ["大专"],
+            }
+        },
+        "unverifiedFilters": ["学历"],
+        "missingFilters": ["学历"],
+    }
+
+    result = ChromeDebugClient._recommend_failed_retry_filters(
+        {"学历": "本科,大专", "薪资": "10-20k"},
+        payload,
+    )
+
+    assert result == {"学历": "大专"}
 
 
 def test_apply_recommend_filters_keeps_failed_filter_after_max_retries() -> None:
