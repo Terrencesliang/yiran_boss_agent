@@ -127,6 +127,42 @@ python -m boss_agent.cli action search-recommendations `
 
 If PowerShell has trouble with Chinese arguments, call the Python helper directly and emit JSON through `sys.stdout.buffer.write(...encode("utf-8"))`.
 
+## 沟通页：新招呼按职位筛未读并索要简历
+
+Use `action request-resume-new-greetings` when the user asks to go to the BOSS 沟通页, click `新招呼`, filter a specified job, switch to `未读`, send a resume-request message, and click the chat toolbar `求简历` button plus its confirmation.
+
+This is a real sending/clicking workflow. Only run it with `--send` when the user explicitly asks to send or execute. Without `--send`, it is a dry-run preview.
+
+Recommended command:
+
+```powershell
+$env:PYTHONPATH='src'
+$env:PYTHONIOENCODING='utf-8'
+python -m boss_agent.cli action request-resume-new-greetings `
+  --endpoint http://127.0.0.1:9222 `
+  --url-contains /web/chat/index `
+  --job-text "天猫运营（服饰） _ 深圳 11-15K" `
+  --send
+```
+
+Important behavior:
+
+- The job text must be the full option text from the chat job dropdown, for example `天猫运营（服饰） _ 深圳 11-15K` or `hrbp _ 深圳 13-18K`.
+- If the user gives a short job name such as `天猫运营` or `hrbp`, first resolve it to the full dropdown option with `capture job-filter-options`.
+- Default message: `您好，方便发一份简历吗？我这边先看一下。`
+- Default operation delay is `2.0` seconds to better mimic human pacing. Override with `--operation-delay-seconds 2`.
+- The workflow skips conversations that already contain resume-related content such as `简历请求已发送`, `对方想发送附件简历`, `附件简历`, or `这是我的简历`.
+- The `求简历` action must complete both clicks: toolbar `求简历`, then confirmation `确定`. The result should include `requestResume.confirm.clicked=true`.
+
+Preview before sending:
+
+```powershell
+python -m boss_agent.cli action request-resume-new-greetings `
+  --endpoint http://127.0.0.1:9222 `
+  --url-contains /web/chat/index `
+  --job-text "天猫运营（服饰） _ 深圳 11-15K"
+```
+
 ## Notes
 
 - Default endpoint is `http://127.0.0.1:9222`.

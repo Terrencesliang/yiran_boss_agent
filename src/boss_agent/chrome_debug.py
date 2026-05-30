@@ -137,12 +137,20 @@ class ChromeDebugClient:
             response = self._send_cdp_command(
                 ws,
                 method="Runtime.evaluate",
-                params={"expression": expression, "returnByValue": True},
+                params={"expression": expression, "returnByValue": True, "awaitPromise": True},
             )
         finally:
             ws.close()
 
-        result = response["result"]["result"]["value"]
+        runtime_result = response.get("result", {}).get("result", {})
+        if "value" not in runtime_result:
+            return {
+                "closed": False,
+                "selector": "resume_panel",
+                "reason": "runtime_evaluate_no_value",
+                "response": response,
+            }
+        result = runtime_result["value"]
         if isinstance(result, dict):
             return result
         return json.loads(result)
@@ -179,13 +187,40 @@ class ChromeDebugClient:
             response = self._send_cdp_command(
                 ws,
                 method="Runtime.evaluate",
-                params={"expression": expression, "returnByValue": True},
+                params={"expression": expression, "returnByValue": True, "awaitPromise": True},
             )
         finally:
             ws.close()
 
         result = response["result"]["result"]["value"]
-        return json.loads(result)
+        payload = json.loads(result)
+        if not payload.get("closed"):
+            try:
+                self._dispatch_escape_key(websocket_url)
+                time.sleep(0.4)
+                verify = self._evaluate_json(
+                    websocket_url,
+                    """
+(() => {
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const stillOpen = Array.from(document.querySelectorAll('.resume-common-dialog, .search-resume, .boss-popup__wrapper, .dialog-wrap.active'))
+    .some(isVisible);
+  return JSON.stringify({ stillOpen });
+})()
+""".strip(),
+                    timeout=5,
+                )
+                if not verify.get("stillOpen"):
+                    return {**payload, "closed": True, "escapeFallback": True}
+                return {**payload, "escapeFallback": True, "verify": verify}
+            except Exception as exc:
+                return {**payload, "escapeFallback": False, "escapeError": str(exc)}
+        return payload
 
     def detect_resume_consent_prompt(self, url_contains: str | None = None) -> dict[str, Any]:
         if self.mock_dir is not None:
@@ -246,7 +281,17 @@ class ChromeDebugClient:
         finally:
             ws.close()
 
-        result = response["result"]["result"]["value"]
+        runtime_result = response.get("result", {}).get("result", {})
+        if "value" not in runtime_result:
+            return {
+                "closed": False,
+                "selector": "resume_panel",
+                "reason": "runtime_evaluate_no_value",
+                "response": response,
+            }
+        result = runtime_result["value"]
+        if isinstance(result, dict):
+            return result
         return json.loads(result)
 
     def capture_attachment_preview_link(self, url_contains: str | None = None) -> dict[str, Any]:
@@ -1077,7 +1122,8 @@ class ChromeDebugClient:
             raise ValueError("Selected page does not have webSocketDebuggerUrl")
 
         expression = """
-(() => {
+(async () => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const isVisible = (el) => {
     if (!el) return false;
     const rect = el.getBoundingClientRect();
@@ -1087,13 +1133,59 @@ class ChromeDebugClient:
       && style.visibility !== 'hidden'
       && style.display !== 'none';
   };
-  const target = Array.from(document.querySelectorAll('.boss-popup__close, .resume-custom-close, .dialog-resume-full .close'))
-    .find((el) => isVisible(el));
+  const hasResumePanel = () => {
+    const selectors = [
+      'iframe[src*="/web/frame/c-resume"]',
+      '.resume-common-dialog',
+      '.search-resume',
+      '.dialog-resume-full',
+      '.dialog-wrap.active .resume-layout-wrap',
+      '.dialog-wrap.active .resume-detail-wrap',
+      '.boss-popup__wrapper canvas',
+      '.boss-dialog__body canvas'
+    ];
+    if (selectors.some((selector) => Array.from(document.querySelectorAll(selector)).some(isVisible))) {
+      return true;
+    }
+    const popupText = Array.from(document.querySelectorAll('.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body'))
+      .filter(isVisible)
+      .map((el) => (el.innerText || el.textContent || '').trim())
+      .join('\\n');
+    return popupText.includes('在线简历')
+      || popupText.includes('工作经历')
+      || popupText.includes('教育经历')
+      || popupText.includes('期望职位')
+      || popupText.includes('个人优势');
+  };
+  if (!hasResumePanel()) {
+    return JSON.stringify({ closed: false, selector: 'resume_panel', reason: 'resume_panel_not_open' });
+  }
+  const target = Array.from(document.querySelectorAll(
+    '.resume-common-dialog .close-btn, .search-resume .close-btn, .new-chat-resume-dialog-main-ui .close-btn, .resume-container .close-btn, .resume-common-dialog .boss-popup__close, .resume-common-dialog .resume-custom-close, .search-resume .boss-popup__close, .search-resume .resume-custom-close, .dialog-resume-full .close, .dialog-resume-full .boss-popup__close, .dialog-wrap.active .close, .dialog-wrap.active .boss-popup__close, .boss-dialog__body .boss-popup__close, .boss-popup__wrapper .boss-popup__close'
+  )).find((el) => isVisible(el));
   if (!target) {
-    return JSON.stringify({ closed: false, selector: '.boss-popup__close', reason: 'not_found' });
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+    await wait(500);
+    return JSON.stringify({
+      closed: !hasResumePanel(),
+      selector: 'Escape',
+      reason: hasResumePanel() ? 'close_not_found' : '',
+      escapeFallback: true
+    });
   }
   target.click();
-  return JSON.stringify({ closed: true, selector: '.boss-popup__close' });
+  await wait(500);
+  if (!hasResumePanel()) {
+    return JSON.stringify({ closed: true, selector: '.boss-popup__close' });
+  }
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+  await wait(500);
+  return JSON.stringify({
+    closed: !hasResumePanel(),
+    selector: '.boss-popup__close',
+    escapeFallback: true,
+    reason: hasResumePanel() ? 'panel_still_open' : ''
+  });
 })()
 """.strip()
 
@@ -1102,13 +1194,207 @@ class ChromeDebugClient:
             response = self._send_cdp_command(
                 ws,
                 method="Runtime.evaluate",
-                params={"expression": expression, "returnByValue": True},
+                params={"expression": expression, "returnByValue": True, "awaitPromise": True},
             )
         finally:
             ws.close()
 
-        result = response["result"]["result"]["value"]
+        runtime_result = response.get("result", {}).get("result", {})
+        if "value" not in runtime_result:
+            return {
+                "closed": False,
+                "selector": "resume_panel",
+                "reason": "runtime_evaluate_no_value",
+                "response": response,
+            }
+        result = runtime_result["value"]
+        if isinstance(result, dict):
+            return result
         return json.loads(result)
+
+    def open_online_resume(self, url_contains: str | None = "/web/chat/index") -> dict[str, Any]:
+        if self.mock_dir is not None:
+            fixture = self.mock_dir / "online_resume_open.json"
+            if fixture.exists():
+                return json.loads(fixture.read_text(encoding="utf-8"))
+            return {
+                "opened": True,
+                "selector": "text:在线简历",
+                "text": "\u5728\u7ebf\u7b80\u5386",
+                "mock": True,
+            }
+
+        pages = self.list_pages()
+        page = self._select_page(pages, url_contains=url_contains)
+        websocket_url = page.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise ValueError("Selected page does not have webSocketDebuggerUrl")
+
+        expression = """
+(async () => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const text = (node) => node ? (node.innerText || node.textContent || '').trim() : '';
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none';
+  };
+  const hasResumePanel = () => {
+    const selectors = [
+      'iframe[src*="/web/frame/c-resume"]',
+      '.dialog-resume-full',
+      '.lib-standard-resume',
+      '.resume-layout-wrap',
+      '.resume-detail-wrap',
+      '.boss-popup__wrapper canvas',
+      '.boss-dialog__body canvas'
+    ];
+    if (selectors.some((selector) => Array.from(document.querySelectorAll(selector)).some(isVisible))) {
+      return true;
+    }
+    const popupText = text(document.querySelector('.boss-popup__wrapper, .boss-dialog__body, .dialog-wrap.active'));
+    return popupText.includes('在线简历')
+      || popupText.includes('工作经历')
+      || popupText.includes('教育经历')
+      || popupText.includes('期望职位')
+      || popupText.includes('个人优势');
+  };
+  if (hasResumePanel()) {
+    return JSON.stringify({ opened: true, alreadyOpen: true, selector: 'resume_panel' });
+  }
+  const roots = [
+    document.querySelector('.chat-conversation'),
+    document.querySelector('.conversation-container'),
+    document.querySelector('.chat-im'),
+    document.body
+  ].filter(Boolean);
+  const candidates = [];
+  for (const root of roots) {
+    for (const el of Array.from(root.querySelectorAll('button, a, span, div, [role="button"]'))) {
+      const label = text(el).replace(/\s+/g, '');
+      if (label === '在线简历') {
+        const rect = el.getBoundingClientRect();
+        candidates.push({ el, area: rect.width * rect.height });
+      }
+    }
+  }
+  candidates.sort((a, b) => a.area - b.area);
+  const targetItem = candidates.find((item) => isVisible(item.el));
+  const target = targetItem?.el || null;
+  if (!target) {
+    return JSON.stringify({ opened: false, selector: 'text:在线简历', reason: 'not_found' });
+  }
+  target.scrollIntoView({ block: 'center' });
+  target.click();
+  for (let i = 0; i < 24; i += 1) {
+    await wait(250);
+    if (hasResumePanel()) {
+      return JSON.stringify({ opened: true, selector: 'text:在线简历', text: text(target), waits: i + 1 });
+    }
+  }
+  return JSON.stringify({ opened: false, selector: 'text:在线简历', text: text(target), reason: 'resume_panel_not_loaded' });
+})()
+""".strip()
+
+        return self._evaluate_json(websocket_url, expression, timeout=10)
+
+    def click_first_common_phrase(self, url_contains: str | None = "/web/chat/index") -> dict[str, Any]:
+        if self.mock_dir is not None:
+            fixture = self.mock_dir / "first_common_phrase.json"
+            if fixture.exists():
+                return json.loads(fixture.read_text(encoding="utf-8"))
+            return {
+                "clicked": True,
+                "selector": "text:\u5e38\u7528\u8bed",
+                "phraseText": "\u4f60\u597d\u554a\uff0c\u53ef\u4ee5\u804a\u4e00\u804a~",
+                "mock": True,
+            }
+
+        pages = self.list_pages()
+        page = self._select_page(pages, url_contains=url_contains)
+        websocket_url = page.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise ValueError("Selected page does not have webSocketDebuggerUrl")
+
+        expression = """
+(async () => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const text = (node) => node ? (node.innerText || node.textContent || '').trim() : '';
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none';
+  };
+  const root = document.querySelector('.conversation-operate')
+    || document.querySelector('.chat-conversation, .conversation, .chat-main, .chat-container')
+    || document;
+  const commonButton = document.querySelector('.conversation-operate .toolbar-icon.changyongyu')
+    || Array.from(root.querySelectorAll('.operate-icon-item, button, a, span, div, [role="button"]'))
+      .find((el) => isVisible(el) && text(el).replace(/\s+/g, '') === '常用语');
+  if (!commonButton) {
+    return JSON.stringify({
+      clicked: false,
+      selector: 'text:常用语',
+      reason: 'common_phrase_button_not_found',
+      visibleButtons: Array.from(root.querySelectorAll('button, a, [role="button"], span, div'))
+        .filter(isVisible)
+        .map((el) => text(el))
+        .filter(Boolean)
+        .slice(0, 60)
+    });
+  }
+  commonButton.click();
+  await wait(700);
+  const panelCandidates = Array.from(document.querySelectorAll(
+    '.phrase-content, .boss-popover, .popover, .common-phrase, .phrase-list, [class*="phrase"]'
+  )).filter(isVisible);
+  const panel = panelCandidates.find((el) => el.classList.contains('phrase-content'))
+    || panelCandidates
+    .filter((el) => text(el).length > 0)
+    .sort((a, b) => text(b).length - text(a).length)[0]
+    || null;
+  if (!panel) {
+    return JSON.stringify({
+      clicked: false,
+      selector: 'first_common_phrase',
+      reason: 'common_phrase_panel_not_found'
+    });
+  }
+  const phraseCandidates = Array.from(panel.querySelectorAll('li, p, a, span, div, [role="button"]'))
+    .filter(isVisible)
+    .map((el) => ({ el, value: text(el), className: String(el.className || '') }))
+    .filter((item) => {
+      const value = item.value.replace(/\s+/g, ' ').trim();
+      if (!value) return false;
+      if (value.includes('常用语') || value.includes('快捷回复') || value.includes('话术')) return false;
+      if (value.includes('添加') || value.includes('管理') || value.includes('搜索') || value.includes('设置')) return false;
+      if (item.className.includes('sentence-blank') || item.className.includes('link-add') || item.className.includes('title')) return false;
+      return item.value.length >= 2 && item.value.length <= 200;
+    });
+  const target = phraseCandidates[0]?.el || null;
+  if (!target) {
+    return JSON.stringify({
+      clicked: false,
+      selector: 'first_common_phrase',
+      reason: 'common_phrase_not_found',
+      panelText: text(panel).slice(0, 500)
+    });
+  }
+  const phraseText = text(target);
+  target.click();
+  return JSON.stringify({ clicked: true, selector: 'first_common_phrase', phraseText });
+})()
+""".strip()
+
+        return self._evaluate_json(websocket_url, expression, timeout=10)
 
     def send_current_message(self, url_contains: str | None = None) -> dict[str, Any]:
         if self.mock_dir is not None:
@@ -3083,23 +3369,24 @@ class ChromeDebugClient:
         while time.time() < deadline:
             latest = self._evaluate_json(websocket_url, build_capture_recommend_detail_resume_expression_v3())
             preview = str(latest.get("rawTextPreview") or "")
-            if latest.get("detailOpen") and self._resume_detail_preview_ready(preview):
+            if latest.get("detailOpen"):
                 canvas_ready = self._wait_recommend_resume_canvas_ready(websocket_url, timeout_seconds=8)
                 latest["canvasReady"] = canvas_ready
                 if canvas_ready.get("ready"):
                     latest = self._augment_resume_with_canvas_ocr(websocket_url, latest)
                     return latest
+                if self._resume_detail_preview_ready(preview):
+                    return latest
             time.sleep(0.5)
-        if latest.get("detailOpen") and self._resume_detail_preview_ready(str(latest.get("rawTextPreview") or "")):
+        if latest.get("detailOpen"):
             latest["canvasReady"] = self._wait_recommend_resume_canvas_ready(websocket_url, timeout_seconds=3)
             if latest["canvasReady"].get("ready"):
                 latest = self._augment_resume_with_canvas_ocr(websocket_url, latest)
+            elif self._resume_detail_preview_ready(str(latest.get("rawTextPreview") or "")):
+                latest.setdefault("captureStatus", "preview_only_canvas_not_ready")
             else:
                 latest["captureStatus"] = "canvas_not_ready"
                 latest.setdefault("ocrStatus", "skipped_canvas_not_ready")
-        elif latest.get("detailOpen"):
-            latest["captureStatus"] = "detail_still_loading"
-            latest.setdefault("ocrStatus", "skipped_detail_still_loading")
         return latest
 
     @staticmethod
@@ -3571,24 +3858,23 @@ class ChromeDebugClient:
         if not before.get("detailOpen"):
             return {"closed": True, "alreadyClosed": True, "before": before}
 
+        self._dispatch_escape_key(websocket_url)
+        after: dict[str, Any] = {}
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            time.sleep(0.3)
+            after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
+            if not after.get("detailOpen"):
+                return {"closed": True, "verifiedClosed": True, "escapeFirst": True, "before": before, "after": after}
+
         payload = self._evaluate_json(websocket_url, build_close_recommend_detail_expression_v2(), timeout=10)
         if payload.get("closed") and payload.get("method") == "dom_click":
-            after: dict[str, Any] = {}
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 time.sleep(0.3)
                 after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
                 if not after.get("detailOpen"):
                     return {**payload, "verifiedClosed": True, "before": before, "after": after}
-            point = payload.get("button") or {}
-            if "x" in point and "y" in point:
-                self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
-                deadline = time.time() + 3.0
-                while time.time() < deadline:
-                    time.sleep(0.3)
-                    after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
-                    if not after.get("detailOpen"):
-                        return {**payload, "verifiedClosed": True, "coordinateFallback": True, "before": before, "after": after}
             self._dispatch_escape_key(websocket_url)
             deadline = time.time() + 3.0
             while time.time() < deadline:
@@ -3600,15 +3886,7 @@ class ChromeDebugClient:
         point = payload.get("button")
         if not point:
             return {**payload, "before": before}
-        self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
-        after = {}
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            time.sleep(0.3)
-            after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
-            if not after.get("detailOpen"):
-                return {"closed": True, "verifiedClosed": True, "selector": payload.get("selector", ""), "button": point, "before": before, "after": after}
-        return {"closed": True, "verifiedClosed": False, "selector": payload.get("selector", ""), "button": point, "before": before, "after": after}
+        return {**payload, "verifiedClosed": False, "before": before, "after": after}
 
     def greet_candidate(
         self,
@@ -5020,10 +5298,10 @@ def build_capture_recommend_detail_resume_expression_v3() -> str:
     const style = el.ownerDocument.defaultView.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
   };
-  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const frame = Array.from(document.querySelectorAll('iframe[src*="/web/frame/recommend"]')).find(isVisible);
   const doc = frame?.contentDocument || document;
   const overlay = Array.from(doc.querySelectorAll(
-    '.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body, .lib-standard-resume, .resume-layout-wrap, .resume-right-side, .resume-detail-wrap'
+    '.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body, .resume-common-dialog, .search-resume, .new-resume-online-main-ui, .lib-standard-resume, .resume-layout-wrap, .resume-right-side, .resume-detail-wrap'
   )).filter(isVisible).sort((a, b) => text(b).length - text(a).length)[0];
   const rightSide = doc.querySelector('.resume-right-side, .resume-simple-box, .resume-item-detail');
   const centerSide = doc.querySelector('.resume-center-side, .resume-detail-wrap');
@@ -5122,11 +5400,17 @@ def build_capture_recommend_detail_resume_expression_v3() -> str:
 def build_capture_recommend_canvas_data_url_expression() -> str:
     return r"""
 (() => {
-  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const frame = Array.from(document.querySelectorAll('iframe[src*="/web/frame/recommend"]')).find(isVisible);
   const doc = frame?.contentDocument || document;
-  const resumeFrame = doc.querySelector('iframe[src*="/web/frame/c-resume"]');
+  const resumeFrame = Array.from(doc.querySelectorAll('iframe[src*="/web/frame/c-resume"]')).find(isVisible);
   const resumeDoc = resumeFrame?.contentDocument;
-  const canvas = resumeDoc?.querySelector('canvas#resume');
+  const canvas = resumeDoc?.querySelector('canvas#resume') || resumeDoc?.querySelector('canvas');
   if (!canvas) {
     return JSON.stringify({
       found: false,
@@ -5161,31 +5445,49 @@ def build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments: i
 (async () => {{
   const maxSegments = {int(max_segments)};
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
-  const doc = frame?.contentDocument || document;
-  let resumeFrame = null;
-  let resumeDoc = null;
-  let canvas = null;
-  for (let attempt = 0; attempt < 24; attempt += 1) {{
-    resumeFrame = doc.querySelector('iframe[src*="/web/frame/c-resume"]');
-    resumeDoc = resumeFrame?.contentDocument;
-    canvas = resumeDoc?.querySelector('canvas#resume');
-    const rootText = String(doc.querySelector('.resume-detail-wrap')?.innerText || doc.body?.innerText || '');
-    const loading = rootText.includes('\u6b63\u5728\u52a0\u8f7d') || rootText.toLowerCase().includes('loading');
-    if (canvas && canvas.width > 100 && canvas.height > 100 && !loading) break;
-    await delay(350);
-  }}
   const isVisible = (el) => {{
     if (!el) return false;
     const rect = el.getBoundingClientRect();
     const style = el.ownerDocument.defaultView.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
   }};
-  const scrollContainer = doc.querySelector('.resume-detail-wrap')
-    || Array.from(doc.querySelectorAll('.resume-layout-wrap, .dialog-wrap.active, .boss-dialog__body, .resume-center-side, .resume-item-detail, div'))
-      .filter(isVisible)
-      .filter((el) => el.scrollHeight > el.clientHeight + 40)
-      .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+  const frame = Array.from(document.querySelectorAll('iframe[src*="/web/frame/recommend"]')).find(isVisible);
+  const doc = frame?.contentDocument || document;
+  let resumeFrame = null;
+  let resumeDoc = null;
+  let canvas = null;
+  for (let attempt = 0; attempt < 24; attempt += 1) {{
+    resumeFrame = Array.from(doc.querySelectorAll('iframe[src*="/web/frame/c-resume"]')).find(isVisible);
+    resumeDoc = resumeFrame?.contentDocument;
+    canvas = resumeDoc?.querySelector('canvas#resume') || resumeDoc?.querySelector('canvas');
+    const rootText = String(doc.querySelector('.resume-detail-wrap')?.innerText || doc.body?.innerText || '');
+    const loading = rootText.includes('\u6b63\u5728\u52a0\u8f7d') || rootText.toLowerCase().includes('loading');
+    if (canvas && canvas.width > 100 && canvas.height > 100 && !loading) break;
+    await delay(350);
+  }}
+  const scrollableScore = (el) => el ? Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0)) : -1;
+  const parentScrollCandidates = Array.from(doc.querySelectorAll(
+    '.iframe-resume-detail, .resume-detail-chat, .resume-detail, .resume-detail-wrap, .resume-layout-wrap, .dialog-wrap.active, .boss-dialog__body, .resume-center-side, .resume-item-detail, div'
+  ))
+    .filter(isVisible)
+    .filter((el) => !resumeFrame || el.contains(resumeFrame))
+    .filter((el) => scrollableScore(el) > 40)
+    .sort((a, b) => scrollableScore(b) - scrollableScore(a));
+  const parentScrollContainer = parentScrollCandidates[0] || null;
+  const resumeScrollCandidates = resumeDoc
+    ? [
+        ...Array.from(resumeDoc.querySelectorAll('.resume-detail-wrap, .resume-layout-wrap, .resume-center-side, .resume-item-detail, .lib-standard-resume, main, section, article, div'))
+          .filter(isVisible),
+        resumeDoc.scrollingElement,
+        resumeDoc.documentElement,
+        resumeDoc.body
+      ].filter(Boolean).filter((el) => scrollableScore(el) > 40).sort((a, b) => scrollableScore(b) - scrollableScore(a))
+    : [];
+  const resumeScrollContainer = resumeScrollCandidates[0] || null;
+  const scrollContainer = scrollableScore(parentScrollContainer) >= scrollableScore(resumeScrollContainer)
+    ? parentScrollContainer
+    : resumeScrollContainer;
+  const scrollWindow = scrollContainer?.ownerDocument?.defaultView || resumeDoc?.defaultView || doc.defaultView || window;
   if (!canvas) {{
     return JSON.stringify({{
       found: false,
@@ -5241,17 +5543,33 @@ def build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments: i
   for (const top of uniquePositions) {{
     scrollContainer.scrollTop = top;
     scrollContainer.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
-    await delay(650);
+    scrollWindow?.dispatchEvent?.(new Event('scroll'));
+    if (typeof scrollWindow?.scrollTo === 'function' && scrollContainer === (resumeDoc?.scrollingElement || resumeDoc?.documentElement || resumeDoc?.body)) {{
+      scrollWindow.scrollTo(0, top);
+    }}
+    await delay(1000);
     segments.push(capture(scrollContainer.scrollTop));
   }}
   scrollContainer.scrollTop = originalScrollTop;
   scrollContainer.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
-  await delay(100);
+  if (typeof scrollWindow?.scrollTo === 'function' && scrollContainer === (resumeDoc?.scrollingElement || resumeDoc?.documentElement || resumeDoc?.body)) {{
+    scrollWindow.scrollTo(0, originalScrollTop);
+  }}
+  await delay(300);
+  if (Math.abs((scrollContainer.scrollTop || 0) - originalScrollTop) > 2) {{
+    scrollContainer.scrollTop = originalScrollTop;
+    scrollContainer.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
+    await delay(300);
+  }}
   return JSON.stringify({{
     found: true,
     frameSrc: resumeFrame?.getAttribute('src') || '',
     scrollContainer: {{
-      selector: scrollContainer.matches?.('.resume-detail-wrap') ? '.resume-detail-wrap' : '',
+      selector: scrollContainer.matches?.('.iframe-resume-detail') ? '.iframe-resume-detail'
+        : scrollContainer.matches?.('.resume-detail-chat') ? '.resume-detail-chat'
+        : scrollContainer.matches?.('.resume-detail-wrap') ? '.resume-detail-wrap'
+        : '',
+      document: scrollContainer.ownerDocument === resumeDoc ? 'resumeFrame' : 'parent',
       originalScrollTop,
       restoredScrollTop: scrollContainer.scrollTop,
       scrollHeight: scrollContainer.scrollHeight,
@@ -5269,13 +5587,19 @@ def build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments: i
 def build_recommend_resume_canvas_ready_expression() -> str:
     return r"""
 (() => {
-  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const frame = Array.from(document.querySelectorAll('iframe[src*="/web/frame/recommend"]')).find(isVisible);
   const doc = frame?.contentDocument || document;
   const root = doc.querySelector('.resume-detail-wrap, .resume-layout-wrap, .dialog-wrap.active') || doc.body;
   const rootText = String(root?.innerText || root?.textContent || '').trim();
-  const resumeFrame = doc.querySelector('iframe[src*="/web/frame/c-resume"]');
+  const resumeFrame = Array.from(doc.querySelectorAll('iframe[src*="/web/frame/c-resume"]')).find(isVisible);
   const resumeDoc = resumeFrame?.contentDocument;
-  const canvas = resumeDoc?.querySelector('canvas#resume');
+  const canvas = resumeDoc?.querySelector('canvas#resume') || resumeDoc?.querySelector('canvas');
   const loading = rootText.includes('\u6b63\u5728\u52a0\u8f7d') || rootText.toLowerCase().includes('loading');
   const rect = canvas ? canvas.getBoundingClientRect() : null;
   let dataUrlLength = 0;
@@ -5717,22 +6041,53 @@ def build_close_recommend_detail_expression_v2() -> str:
   };
   const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
   const doc = frame?.contentDocument || document;
+  const detailCandidates = Array.from(doc.querySelectorAll(
+    '.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body, .lib-standard-resume, .resume-layout-wrap, .resume-right-side, .resume-detail-wrap'
+  ))
+    .filter(isVisible)
+    .filter((el) => {
+      const value = text(el);
+      return value.length > 40 && /(\u6253\u62db\u547c|\u5de5\u4f5c\u7ecf\u5386|\u6559\u80b2\u7ecf\u5386|\u7ecf\u5386\u6982\u89c8|\u671f\u671b\u804c\u4f4d)/.test(value);
+    })
+    .sort((a, b) => text(b).length - text(a).length);
+  const detail = detailCandidates[0] || null;
+  if (!detail) {
+    return JSON.stringify({ closed: false, reason: 'detail_not_open' });
+  }
+  const root = detail.closest('.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body, .resume-layout-wrap')
+    || detail;
   const selectors = [
     '.close-btn',
     '.boss-popup__close',
     '.resume-custom-close',
     '.dialog-resume-full .close',
-    '.resume-common-dialog .close',
-    '[class*="close"]'
+    '.resume-common-dialog .close'
   ];
-  const nodes = selectors.flatMap((selector) => Array.from(doc.querySelectorAll(selector)));
+  const nodes = selectors.flatMap((selector) => Array.from(root.querySelectorAll(selector)));
   const button = nodes.find(isVisible)
-    || Array.from(doc.querySelectorAll('button, a, span, div'))
+    || Array.from(root.querySelectorAll('button, a, span, div'))
       .find((el) => isVisible(el) && ['x', 'X', '\u00d7', '\u5173\u95ed'].includes(text(el)));
   if (!button) {
     return JSON.stringify({ closed: false, reason: 'close_button_not_found' });
   }
   const rect = button.getBoundingClientRect();
+  const viewWidth = doc.defaultView?.innerWidth || doc.documentElement.clientWidth || 0;
+  const isTopRight = rect.top <= 48 && rect.left >= Math.max(0, viewWidth - 180);
+  if (isTopRight) {
+    return JSON.stringify({
+      closed: false,
+      reason: 'unsafe_top_right_close_button',
+      selector: button.className || button.tagName,
+      button: {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      }
+    });
+  }
   button.click();
   return JSON.stringify({
     closed: true,
@@ -5836,6 +6191,13 @@ def build_capture_conversation_expression() -> str:
     jobTitle,
     salary,
     city,
+    sidebarText,
+    candidateProfileText: sidebarText,
+    profileTimeline: {
+      rawText: sidebarText,
+      workExperiences: [],
+      educations: []
+    },
     messages
   });
 })()

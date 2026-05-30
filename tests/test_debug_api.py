@@ -1,5 +1,6 @@
 import json
 import argparse
+from datetime import date
 from pathlib import Path
 
 from boss_agent.chrome_debug import ChromeDebugClient
@@ -14,6 +15,7 @@ from boss_agent.chrome_debug import build_chrome_launch_command
 from boss_agent.chrome_debug import classify_page
 from boss_agent.cli import _load_screen_recommend_detail_config
 from boss_agent.cli import _format_keyword_evidence
+from boss_agent.cli import _analyze_candidate_precheck
 from boss_agent.cli import _reply_unread_with_knowledge
 from boss_agent.cli import _request_resume_new_greetings
 from boss_agent.cli import _screen_recommend_detail
@@ -710,12 +712,22 @@ class RequestResumeFakeClient:
         *,
         job_switched: bool = True,
         conversation_text: str = "\u5019\u9009\u4eba\u60f3\u6c9f\u901a",
-        request_resume_clicked: bool = True,
+        profile_text: str = "2022.05-2026.05 \u67d0\u516c\u53f8 \u5929\u732b\u8fd0\u8425",
+        candidate_salary: str = "11-15K",
+        online_resume_opened: bool = True,
+        resume_text: str = "\u5019\u9009\u4eba\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c\uff0c\u8d1f\u8d23\u5e97\u94fa\u8fd0\u8425\u548c\u6d3b\u52a8\u7b56\u5212\u3002",
     ) -> None:
         self.job_switched = job_switched
         self.conversation_text = conversation_text
-        self.request_resume_clicked = request_resume_clicked
+        self.profile_text = profile_text
+        self.candidate_salary = candidate_salary
+        self.online_resume_opened = online_resume_opened
+        self.resume_text = resume_text
         self.filled_messages = []
+        self.sent_messages = 0
+        self.request_resume_clicks = 0
+        self.online_resume_open_calls = 0
+        self.common_phrase_clicks = 0
 
     def switch_conversation_status_tab(self, label: str, url_contains=None) -> dict:
         return {"switched": True, "label": label, "matchedText": "\u65b0\u62db\u547c(45)"}
@@ -766,6 +778,10 @@ class RequestResumeFakeClient:
             "conversation": {
                 "candidateName": expected_candidate_name,
                 "jobTitle": expected_job_title,
+                "salary": self.candidate_salary,
+                "profileTimeline": {"rawText": self.profile_text},
+                "candidateProfileText": self.profile_text,
+                "sidebarText": self.profile_text,
                 "messages": [{"direction": "inbound", "text": self.conversation_text}],
             },
         }
@@ -775,12 +791,25 @@ class RequestResumeFakeClient:
         return {"filled": True, "body": body}
 
     def send_current_message(self, url_contains=None) -> dict:
+        self.sent_messages += 1
         return {"sent": True}
 
     def click_request_resume_button(self, url_contains=None) -> dict:
-        if not self.request_resume_clicked:
-            return {"clicked": False, "reason": "not_found", "text": "\u6c42\u7b80\u5386"}
+        self.request_resume_clicks += 1
         return {"clicked": True, "text": "\u6c42\u7b80\u5386"}
+
+    def open_online_resume(self, url_contains=None) -> dict:
+        self.online_resume_open_calls += 1
+        if not self.online_resume_opened:
+            return {"opened": False, "reason": "not_found", "selector": "text:\u5728\u7ebf\u7b80\u5386"}
+        return {"opened": True, "selector": "text:\u5728\u7ebf\u7b80\u5386"}
+
+    def capture_candidate_resume(self, url_contains=None) -> dict:
+        return {"detailOpen": True, "rawTextPreview": self.resume_text}
+
+    def click_first_common_phrase(self, url_contains=None) -> dict:
+        self.common_phrase_clicks += 1
+        return {"clicked": True, "phraseText": "\u4f60\u597d\u554a\uff0c\u53ef\u4ee5\u804a\u4e00\u804a~"}
 
     def close_attachment_preview(self, url_contains=None) -> dict:
         return {"closed": True}
@@ -947,7 +976,7 @@ def test_reply_unread_with_knowledge_stops_when_job_filter_fails(tmp_path: Path)
     assert result["processedCount"] == 0
 
 
-def test_request_resume_new_greetings_send_clicks_message_and_resume_button() -> None:
+def test_request_resume_new_greetings_matching_online_resume_sends_first_common_phrase() -> None:
     client = RequestResumeFakeClient()
 
     result = _request_resume_new_greetings(
@@ -960,14 +989,52 @@ def test_request_resume_new_greetings_send_clicks_message_and_resume_button() ->
         wait_after_unread=0,
         operation_delay_seconds=0,
         send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
     )
 
     assert result["dryRun"] is False
     assert result["successCount"] == 1
     assert result["failedCount"] == 0
+    assert result["results"][0]["commonPhrase"]["clicked"] is True
     assert result["results"][0]["send"]["sent"] is True
-    assert result["results"][0]["requestResume"]["clicked"] is True
-    assert client.filled_messages == ["\u60a8\u597d\uff0c\u65b9\u4fbf\u53d1\u4e00\u4efd\u7b80\u5386\u5417\uff1f"]
+    assert result["results"][0]["draftFill"] is None
+    assert result["results"][0]["requestResume"] is None
+    assert client.filled_messages == []
+    assert client.common_phrase_clicks == 1
+    assert client.sent_messages == 1
+    assert client.request_resume_clicks == 0
+
+
+def test_request_resume_new_greetings_salary_precheck_then_resume_ocr_then_common_phrase() -> None:
+    client = RequestResumeFakeClient(
+        candidate_salary="11-15K",
+        profile_text="2023.01-\u81f3\u4eca \u67d0\u7535\u5546\u516c\u53f8 \u5929\u732b\u8fd0\u8425",
+        resume_text="\u672c\u4eba\u67093\u5e74\u5929\u732b\u7535\u5546\u8fd0\u8425\u7ecf\u9a8c\uff0c\u8d1f\u8d23\u5e97\u94fa\u65e5\u5e38\u8fd0\u8425\u548c\u6d3b\u52a8\u7b56\u5212\u3002",
+    )
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u5929\u732b\u8fd0\u8425\uff08\u670d\u9970\uff09 _ \u6df1\u5733 11-15K",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
+    )
+
+    item = result["results"][0]
+    assert item["candidatePrecheck"]["skip"] is False
+    assert item["candidatePrecheck"]["jobSalary"]["raw"] == "11-15K"
+    assert item["candidatePrecheck"]["candidateSalary"]["raw"] == "11-15K"
+    assert item["onlineResumeOpen"]["opened"] is True
+    assert item["analysis"]["meetsCriteria"] is True
+    assert item["commonPhrase"]["clicked"] is True
+    assert item["send"]["sent"] is True
+    assert client.common_phrase_clicks == 1
+    assert client.sent_messages == 1
 
 
 def test_request_resume_new_greetings_skips_existing_resume_request() -> None:
@@ -983,6 +1050,7 @@ def test_request_resume_new_greetings_skips_existing_resume_request() -> None:
         wait_after_unread=0,
         operation_delay_seconds=0,
         send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
     )
 
     assert result["successCount"] == 0
@@ -1004,6 +1072,7 @@ def test_request_resume_new_greetings_stops_when_job_filter_fails() -> None:
         wait_after_unread=0,
         operation_delay_seconds=0,
         send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
     )
 
     assert result["reason"] == "job_filter_not_switched"
@@ -1011,8 +1080,8 @@ def test_request_resume_new_greetings_stops_when_job_filter_fails() -> None:
     assert result["processedCount"] == 0
 
 
-def test_request_resume_new_greetings_continues_when_resume_button_missing() -> None:
-    client = RequestResumeFakeClient(request_resume_clicked=False)
+def test_request_resume_new_greetings_skips_when_online_resume_missing() -> None:
+    client = RequestResumeFakeClient(online_resume_opened=False)
 
     result = _request_resume_new_greetings(
         client=client,
@@ -1024,14 +1093,176 @@ def test_request_resume_new_greetings_continues_when_resume_button_missing() -> 
         wait_after_unread=0,
         operation_delay_seconds=0,
         send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
     )
 
     assert result["successCount"] == 0
-    assert result["failedCount"] == 1
+    assert result["skippedCount"] == 1
     assert result["processedCount"] == 1
-    assert result["results"][0]["send"]["sent"] is True
-    assert result["results"][0]["requestResume"]["clicked"] is False
-    assert result["results"][0]["reason"] == "not_found"
+    assert result["results"][0]["onlineResumeOpen"]["opened"] is False
+    assert result["results"][0]["draftFill"] is None
+    assert result["results"][0]["reason"] == "online_resume_not_found"
+    assert client.filled_messages == []
+    assert client.sent_messages == 0
+    assert client.request_resume_clicks == 0
+
+
+def test_request_resume_new_greetings_skips_when_online_resume_not_match() -> None:
+    client = RequestResumeFakeClient(resume_text="\u5019\u9009\u4eba\u67093\u5e74\u884c\u653f\u7ecf\u9a8c")
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
+    )
+
+    assert result["successCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["results"][0]["reason"] == "criteria_not_met"
+    assert result["results"][0]["draftFill"] is None
+    assert client.filled_messages == []
+
+
+def test_request_resume_new_greetings_skips_candidate_precheck_before_online_resume() -> None:
+    client = RequestResumeFakeClient(profile_text="2023.06-2024.04 \u67d0\u516c\u53f8 \u8fd0\u8425\n26\u5e74\u6bd5\u4e1a")
+
+    result = _request_resume_new_greetings(
+        client=client,
+        url_contains="/web/chat/index",
+        job_text="\u6587\u5458 _ \u73e0\u6d77 5-6K",
+        message="\u60a8\u597d",
+        max_count=1,
+        inbox_scrolls=5,
+        wait_after_unread=0,
+        operation_delay_seconds=0,
+        send=True,
+        criteria="\u67093\u5e74\u5929\u732b\u7535\u5546\u7ecf\u9a8c",
+    )
+
+    assert result["successCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["results"][0]["reason"] == "candidate_precheck_skipped"
+    assert result["results"][0]["candidatePrecheck"]["skip"] is True
+    assert client.online_resume_open_calls == 0
+
+
+def test_candidate_precheck_skips_fresh_graduate_marker() -> None:
+    result = _analyze_candidate_precheck(
+        {"profileTimeline": {"rawText": "2023-2025 \u6e56\u5317\u5e08\u8303\u5927\u5b66 \u672c\u79d1\n26\u5e74\u6bd5\u4e1a"}},
+        job_text="\u5929\u732b\u8fd0\u8425",
+    )
+
+    assert result["skip"] is True
+    assert "fresh_graduate" in result["reasons"]
+
+
+def test_candidate_precheck_ignores_fresh_graduate_for_assistant_or_intern_job() -> None:
+    result = _analyze_candidate_precheck(
+        {"profileTimeline": {"rawText": "2023-2025 \u6e56\u5317\u5e08\u8303\u5927\u5b66 \u672c\u79d1\n26\u5e74\u5e94\u5c4a\u751f"}},
+        job_text="\u8fd0\u8425\u52a9\u7406/\u4e13\u5458",
+    )
+
+    assert result["skip"] is False
+    assert result["freshGraduateCheckExempt"] is True
+
+
+def test_candidate_precheck_skips_candidate_salary_below_job_range() -> None:
+    result = _analyze_candidate_precheck(
+        {
+            "salary": "6-10K",
+            "profileTimeline": {
+                "rawText": "2024.03-\u81f3\u4eca\n2020-2024\n\u67d0\u7535\u5b50\u5546\u52a1\u516c\u53f8 \u00b7 \u5929\u732b\u8fd0\u8425\n\u67d0\u5927\u5b66 \u00b7 \u672c\u79d1"
+            },
+        },
+        job_text="\u5929\u732b\u8fd0\u8425\uff08\u670d\u9970\uff09 _ \u6df1\u5733 11-15K",
+    )
+
+    assert result["skip"] is True
+    assert "candidate_salary_below_job_range" in result["reasons"]
+    assert result["jobSalary"]["min"] == 11
+    assert result["candidateSalary"]["max"] == 10
+
+
+def test_candidate_precheck_allows_overlapping_candidate_salary() -> None:
+    result = _analyze_candidate_precheck(
+        {
+            "salary": "10-14K",
+            "profileTimeline": {
+                "rawText": "2024.03-\u81f3\u4eca\n2020-2024\n\u67d0\u7535\u5b50\u5546\u52a1\u516c\u53f8 \u00b7 \u5929\u732b\u8fd0\u8425\n\u67d0\u5927\u5b66 \u00b7 \u672c\u79d1"
+            },
+        },
+        job_text="\u5929\u732b\u8fd0\u8425\uff08\u670d\u9970\uff09 _ \u6df1\u5733 11-15K",
+    )
+
+    assert result["skip"] is False
+
+
+def test_candidate_precheck_skips_gap_between_jobs() -> None:
+    result = _analyze_candidate_precheck(
+        {
+            "profileTimeline": {
+                "rawText": "2020.01-2021.01 A\u516c\u53f8 \u8fd0\u8425\n2022.03-2026.05 B\u516c\u53f8 \u5929\u732b\u8fd0\u8425"
+            }
+        }
+    )
+
+    assert result["skip"] is True
+    assert result["evidence"][0]["type"] == "work_gap_between_jobs"
+    assert result["evidence"][0]["gapMonths"] >= 6
+
+
+def test_candidate_precheck_pairs_sidebar_dates_with_descriptions_and_excludes_education() -> None:
+    result = _analyze_candidate_precheck(
+        {
+            "profileTimeline": {
+                "rawText": (
+                    "2024.07-2026.04\n"
+                    "2023.06-2023.10\n"
+                    "2019-2024\n"
+                    "\u91d1\u5c0f\u535a\u79d1\u6280\u54a8\u8be2 \u00b7 \u6570\u5b66\u6559\u5e08\n"
+                    "\u4e45\u5c71\u5de5\u7a0b \u00b7 \u8fd0\u8425\u52a9\u7406/\u4e13\u5458\n"
+                    "\u8386\u7530\u5b66\u9662 \u00b7 \u5de5\u7a0b\u7ba1\u7406 \u00b7 \u672c\u79d1"
+                )
+            }
+        },
+        today=date(2026, 5, 29),
+    )
+
+    work_items = result["profileTimeline"]["workExperiences"]
+    assert len(work_items) == 2
+    assert not any("2019-2024" in item["raw"] for item in work_items)
+    assert result["skip"] is True
+    assert result["evidence"][0]["gapMonths"] == 8
+
+
+def test_candidate_precheck_skips_recent_gap() -> None:
+    result = _analyze_candidate_precheck(
+        {"profileTimeline": {"rawText": "2020.01-2024.04 A\u516c\u53f8 \u5929\u732b\u8fd0\u8425"}},
+        today=date(2026, 5, 29),
+    )
+
+    assert result["skip"] is True
+    assert result["evidence"][0]["type"] == "recent_work_gap"
+
+
+def test_candidate_precheck_allows_current_or_continuous_work() -> None:
+    result = _analyze_candidate_precheck(
+        {
+            "profileTimeline": {
+                "rawText": "2020.01-2022.01 A\u516c\u53f8 \u8fd0\u8425\n2022.02-\u81f3\u4eca B\u516c\u53f8 \u5929\u732b\u8fd0\u8425\n2020-2024 \u67d0\u5927\u5b66 \u672c\u79d1"
+            }
+        },
+        today=date(2026, 5, 29),
+    )
+
+    assert result["skip"] is False
 
 
 def test_capture_recommend_resume_cards_from_mock_returns_cards() -> None:
@@ -1701,6 +1932,55 @@ def test_screen_recommend_detail_mock_greets_matches_and_reports_all(tmp_path: P
     assert result["greetedCount"] == 1
     assert result["report"]["rowCount"] == 2
     assert report_path.exists()
+    report_text = report_path.read_text(encoding="utf-8-sig")
+    assert "confidence_score" in report_text
+    assert "confidence_level" in report_text
+    assert "experience_evidence" in report_text
+    assert "rejected_evidence" in report_text
+    assert "confidenceLevel" in result["processed"][0]
+
+
+def test_screen_recommend_detail_reports_low_confidence_without_greeting(tmp_path: Path) -> None:
+    class LowConfidenceRecommendClient(ChromeDebugClient):
+        def capture_candidate_resume(self, url_contains=None) -> dict:
+            return {
+                "detailOpen": True,
+                "rawTextPreview": "候选人熟悉天猫店铺运营、活动策划和推广投放，但简历没有明确起止时间。",
+            }
+
+        def click_recommend_card_greet(self, candidate_id=None, card_index=None, url_contains="/web/chat/recommend") -> dict:
+            raise AssertionError("low-confidence candidate must not be greeted")
+
+        def click_recommend_detail_greet(self, url_contains="/web/chat/recommend") -> dict:
+            raise AssertionError("low-confidence candidate must not be greeted")
+
+    client = LowConfidenceRecommendClient(
+        endpoint="http://127.0.0.1:9222",
+        mock_dir=FIXTURES,
+    )
+    report_path = tmp_path / "recommend_detail.csv"
+
+    result = _screen_recommend_detail(
+        client=client,
+        url_contains="/web/chat/recommend",
+        job_title="",
+        city="",
+        filters={},
+        criteria="有3年天猫电商运营经验",
+        model=None,
+        max_greetings=30,
+        max_checks=1,
+        post_filter_wait_seconds=0,
+        report_path=report_path,
+        dry_run=False,
+    )
+
+    assert result["checkedCount"] == 1
+    assert result["matchedCount"] == 0
+    assert result["greetedCount"] == 0
+    assert result["processed"][0]["analysis"]["confidenceLevel"] in {"low", "medium"}
+    assert result["processed"][0]["analysis"]["confidenceScore"] < 80
+    assert "confidence_level" in report_path.read_text(encoding="utf-8-sig")
 
 
 def test_screen_recommend_detail_closes_previous_detail_before_each_open(tmp_path: Path) -> None:

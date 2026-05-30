@@ -6,6 +6,7 @@ import json
 import re
 import time
 import random
+from datetime import date
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -165,10 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
     request_resume_parser.add_argument("--url-contains", default="/web/chat/index")
     request_resume_parser.add_argument("--job-text", required=True)
     request_resume_parser.add_argument("--message", default="您好，方便发一份简历吗？我这边先看一下。")
+    request_resume_parser.add_argument("--criteria", default="")
     request_resume_parser.add_argument("--max-count", type=int, default=50)
     request_resume_parser.add_argument("--inbox-scrolls", type=int, default=20)
     request_resume_parser.add_argument("--wait-after-unread", type=float, default=3.0)
-    request_resume_parser.add_argument("--operation-delay-seconds", type=float, default=2.0)
+    request_resume_parser.add_argument("--operation-delay-seconds", type=float, default=1.0)
     request_resume_parser.add_argument("--send", action="store_true")
 
     knowledge_reply_parser = action_subparsers.add_parser("reply-unread-with-knowledge")
@@ -550,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
                     wait_after_unread=args.wait_after_unread,
                     operation_delay_seconds=args.operation_delay_seconds,
                     send=args.send,
+                    criteria=args.criteria,
                 )
             )
         if args.action_command == "reply-unread-with-knowledge":
@@ -1102,7 +1105,12 @@ def _screen_recommend_detail(
                         model=model,
                     )
                     analysis = {**analysis, "analysisInputSource": "resume_preview", "analysisInputLength": len(resume_preview_text)}
-                    if analysis.get("meetsCriteria"):
+                    confidence_level = str(analysis.get("confidenceLevel") or "").lower()
+                    llm_fallback_error = str(analysis.get("agent") or "") == "rules_fallback_after_llm_error"
+                    high_confidence = not confidence_level or confidence_level == "high"
+                    if llm_fallback_error:
+                        reason = "llm_error_no_auto_greet"
+                    elif analysis.get("meetsCriteria") and high_confidence:
                         if dry_run:
                             greet_result = {"greeted": False, "dryRun": True}
                         else:
@@ -1116,6 +1124,8 @@ def _screen_recommend_detail(
                             operation_delay()
                             if greet_result.get("greeted"):
                                 greeted_count += 1
+                    elif analysis.get("meetsCriteria"):
+                        reason = "criteria_low_confidence"
                     else:
                         reason = "criteria_not_met"
         except Exception as exc:
@@ -1155,6 +1165,9 @@ def _screen_recommend_detail(
                 "postCloseSkipSimilarRecommend": post_close_skip_result,
                 "name": candidate_name,
                 "meetsCriteria": bool(analysis.get("meetsCriteria")),
+                "confidenceScore": analysis.get("confidenceScore", ""),
+                "confidenceLevel": analysis.get("confidenceLevel", ""),
+                "confidenceReason": analysis.get("confidenceReason", ""),
                 "greeted": bool(greet_result and greet_result.get("greeted")),
                 "reason": reason,
             }
@@ -1434,8 +1447,15 @@ def _parse_salary_range(value: str) -> tuple[int, int] | None:
     return lower, upper
 
 
-def _ranges_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
-    return left[0] <= right[1] and right[0] <= left[1]
+def _ranges_overlap(left: tuple[int, int] | dict[str, Any], right: tuple[int, int] | dict[str, Any]) -> bool:
+    def bounds(value: tuple[int, int] | dict[str, Any]) -> tuple[float, float]:
+        if isinstance(value, dict):
+            return float(value.get("min", 0)), float(value.get("max", 0))
+        return float(value[0]), float(value[1])
+
+    left_min, left_max = bounds(left)
+    right_min, right_max = bounds(right)
+    return left_min <= right_max and right_min <= left_max
 
 
 def _first_int_matching(value: str, pattern: str) -> int | None:
@@ -1469,6 +1489,11 @@ def _write_recommend_detail_report(
                 "job_title": job_title,
                 "candidate": item.get("name", ""),
                 "meets_criteria": "yes" if item.get("meetsCriteria") else "no",
+                "confidence_score": analysis.get("confidenceScore", item.get("confidenceScore", "")),
+                "confidence_level": analysis.get("confidenceLevel", item.get("confidenceLevel", "")),
+                "confidence_reason": analysis.get("confidenceReason", item.get("confidenceReason", "")),
+                "experience_evidence": _format_experience_evidence(analysis.get("experienceEvidence") or []),
+                "rejected_evidence": _format_rejected_evidence(analysis.get("rejectedEvidence") or []),
                 "greeted": "yes" if item.get("greeted") else "no",
                 "greet_status": json.dumps(greet, ensure_ascii=False) if greet else item.get("reason", ""),
                 "candidate_summary": analysis.get("candidateSummary", ""),
@@ -1497,6 +1522,7 @@ def _write_recommend_detail_report(
             sheet.title = "recommend_detail"
             headers = list(rows[0].keys()) if rows else [
                 "checked_at", "job_title", "candidate", "meets_criteria", "greeted",
+                "confidence_score", "confidence_level", "confidence_reason", "experience_evidence", "rejected_evidence",
                 "greet_status", "candidate_summary", "reasons", "risks", "keyword_evidence", "criteria",
                 "agent", "analysis_input_source", "analysis_input_length",
                 "resume_source", "ocr_status", "ocr_error", "resume_preview"
@@ -1535,6 +1561,35 @@ def _format_keyword_evidence(analysis: dict[str, Any]) -> str:
         if evidence and evidence not in detail:
             detail = f"{detail}（{evidence}）" if detail else evidence
         pieces.append(f"{label}：{detail}" if label and detail else label or detail)
+    return "；".join(pieces)
+
+def _format_experience_evidence(items: list[dict[str, Any]]) -> str:
+    pieces: list[str] = []
+    for item in items:
+        company = str(item.get("company") or "").strip()
+        title = str(item.get("title") or "").strip()
+        start = str(item.get("start") or "").strip()
+        end = str(item.get("end") or "").strip()
+        months = item.get("months", "")
+        terms = "、".join(str(term) for term in (item.get("platformTerms") or item.get("roleTerms") or [])[:5])
+        text = str(item.get("evidenceText") or "").strip()
+        head = " ".join(part for part in [company, title, f"{start}-{end}".strip("-")] if part)
+        detail = f"{months}个月" if months != "" else ""
+        if terms:
+            detail = f"{detail} 命中:{terms}".strip()
+        if text:
+            detail = f"{detail} {text[:120]}".strip()
+        pieces.append(f"{head} | {detail}".strip(" |"))
+    return "；".join(pieces)
+
+
+def _format_rejected_evidence(items: list[dict[str, Any]]) -> str:
+    pieces: list[str] = []
+    for item in items:
+        reason = str(item.get("reason") or "").strip()
+        raw = str(item.get("raw") or item.get("text") or item.get("evidenceText") or "").strip()
+        if reason or raw:
+            pieces.append(f"{reason}: {raw[:120]}".strip(": "))
     return "；".join(pieces)
 
 
@@ -1775,12 +1830,19 @@ def _request_resume_new_greetings(
     wait_after_unread: float,
     operation_delay_seconds: float,
     send: bool,
+    criteria: str = "",
 ) -> dict[str, Any]:
     dry_run = not send
+    if send and not criteria.strip():
+        return _request_resume_new_greetings_stopped(
+            job_text, message, criteria, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+            None, None, None, None, "criteria_required",
+        )
+
     switch_status = client.switch_conversation_status_tab(label="\u65b0\u62db\u547c", url_contains=url_contains)
     if not switch_status.get("switched"):
         return _request_resume_new_greetings_stopped(
-            job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+            job_text, message, criteria, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
             switch_status, None, None, None, "status_tab_not_switched",
         )
     _sleep_operation_delay(operation_delay_seconds)
@@ -1788,7 +1850,7 @@ def _request_resume_new_greetings(
     switch_job = client.switch_job_filter(job_text=job_text, url_contains=url_contains)
     if not switch_job.get("switched"):
         return _request_resume_new_greetings_stopped(
-            job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+            job_text, message, criteria, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
             switch_status, switch_job, None, None, "job_filter_not_switched",
         )
     _sleep_operation_delay(operation_delay_seconds)
@@ -1813,8 +1875,13 @@ def _request_resume_new_greetings(
                     "openConversation": None,
                     "conversationReady": None,
                     "fill": None,
+                    "draftFill": None,
                     "send": None,
                     "requestResume": None,
+                    "candidatePrecheck": None,
+                    "onlineResumeOpen": None,
+                    "resume": None,
+                    "analysis": None,
                     "closeAttachmentPreview": None,
                     "success": False,
                     "skipped": True,
@@ -1845,8 +1912,13 @@ def _request_resume_new_greetings(
                     "openConversation": open_result,
                     "conversationReady": readiness,
                     "fill": None,
+                    "draftFill": None,
                     "send": None,
                     "requestResume": None,
+                    "candidatePrecheck": None,
+                    "onlineResumeOpen": None,
+                    "resume": None,
+                    "analysis": None,
                     "closeAttachmentPreview": close_result,
                     "success": False,
                     "skipped": True,
@@ -1856,6 +1928,34 @@ def _request_resume_new_greetings(
             continue
 
         conversation = readiness.get("conversation", {})
+        candidate_precheck = _analyze_candidate_precheck(
+            conversation,
+            job_text=job_text,
+        )
+        if candidate_precheck.get("skip"):
+            close_result = client.close_attachment_preview(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "draftFill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "candidatePrecheck": candidate_precheck,
+                    "onlineResumeOpen": None,
+                    "resume": None,
+                    "analysis": None,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "candidate_precheck_skipped",
+                }
+            )
+            continue
+
         if _conversation_has_resume_request_or_attachment(conversation):
             close_result = client.close_attachment_preview(url_contains=url_contains)
             _sleep_operation_delay(operation_delay_seconds)
@@ -1865,8 +1965,13 @@ def _request_resume_new_greetings(
                     "openConversation": open_result,
                     "conversationReady": readiness,
                     "fill": None,
+                    "draftFill": None,
                     "send": None,
                     "requestResume": None,
+                    "candidatePrecheck": candidate_precheck,
+                    "onlineResumeOpen": None,
+                    "resume": None,
+                    "analysis": None,
                     "closeAttachmentPreview": close_result,
                     "success": False,
                     "skipped": True,
@@ -1875,55 +1980,132 @@ def _request_resume_new_greetings(
             )
             continue
 
-        already_sent_message = _conversation_has_outbound_resume_request_text(conversation, message)
-        fill_result = None
-        send_result = None
-        request_resume = None
-        reason = ""
-        if already_sent_message:
-            request_resume = client.click_request_resume_button(url_contains=url_contains)
+        online_resume_open = client.open_online_resume(url_contains=url_contains)
+        _sleep_operation_delay(operation_delay_seconds)
+        if not online_resume_open.get("opened"):
+            close_result = client.close_attachment_preview(url_contains=url_contains)
             _sleep_operation_delay(operation_delay_seconds)
-            if not request_resume.get("clicked"):
-                reason = str(request_resume.get("reason") or "request_resume_button_not_clicked")
-        else:
-            fill_result = client.fill_chat_input(message, url_contains=url_contains)
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "draftFill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "candidatePrecheck": candidate_precheck,
+                    "onlineResumeOpen": online_resume_open,
+                    "resume": None,
+                    "analysis": None,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "online_resume_not_found",
+                }
+            )
+            continue
+
+        resume = client.capture_candidate_resume(url_contains=url_contains)
+        _sleep_operation_delay(operation_delay_seconds)
+        resume_text = str(resume.get("rawTextPreview") or "").strip()
+        if not resume_text:
+            close_result = client.close_attachment_preview(url_contains=url_contains)
             _sleep_operation_delay(operation_delay_seconds)
-            if fill_result.get("filled"):
-                send_result = client.send_current_message(url_contains=url_contains)
-                _sleep_operation_delay(operation_delay_seconds)
-                if send_result.get("sent"):
-                    request_resume = client.click_request_resume_button(url_contains=url_contains)
-                    _sleep_operation_delay(operation_delay_seconds)
-                    if not request_resume.get("clicked"):
-                        reason = str(request_resume.get("reason") or "request_resume_button_not_clicked")
-                else:
-                    reason = str(send_result.get("reason") or "send_failed")
-            else:
-                reason = str(fill_result.get("reason") or "fill_failed")
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "draftFill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "candidatePrecheck": candidate_precheck,
+                    "onlineResumeOpen": online_resume_open,
+                    "resume": resume,
+                    "analysis": None,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": "resume_not_captured",
+                }
+            )
+            continue
+
+        analysis = analyze_resume_against_criteria(
+            resume_text=resume_text[:6000],
+            criteria=criteria,
+            model=None,
+        )
+        analysis = {**analysis, "analysisInputSource": "online_resume_ocr", "analysisInputLength": len(resume_text[:6000])}
+        confidence_level = str(analysis.get("confidenceLevel") or "").lower()
+        llm_fallback_error = str(analysis.get("agent") or "") == "rules_fallback_after_llm_error"
+        if llm_fallback_error or not analysis.get("meetsCriteria") or (confidence_level and confidence_level != "high"):
+            close_result = client.close_attachment_preview(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            results.append(
+                {
+                    "target": item,
+                    "openConversation": open_result,
+                    "conversationReady": readiness,
+                    "fill": None,
+                    "draftFill": None,
+                    "send": None,
+                    "requestResume": None,
+                    "candidatePrecheck": candidate_precheck,
+                    "onlineResumeOpen": online_resume_open,
+                    "resume": resume,
+                    "analysis": analysis,
+                    "closeAttachmentPreview": close_result,
+                    "success": False,
+                    "skipped": True,
+                    "reason": (
+                        "llm_error_no_auto_send"
+                        if llm_fallback_error
+                        else "criteria_low_confidence" if analysis.get("meetsCriteria") else "criteria_not_met"
+                    ),
+                }
+            )
+            continue
+
         close_result = client.close_attachment_preview(url_contains=url_contains)
         _sleep_operation_delay(operation_delay_seconds)
-        success = bool(
-            request_resume and request_resume.get("clicked")
-            and (already_sent_message or (send_result and send_result.get("sent")))
-        )
+        common_phrase = client.click_first_common_phrase(url_contains=url_contains)
+        _sleep_operation_delay(operation_delay_seconds)
+        reason = ""
+        send_result = None
+        if common_phrase.get("clicked"):
+            send_result = client.send_current_message(url_contains=url_contains)
+            _sleep_operation_delay(operation_delay_seconds)
+            if not send_result.get("sent"):
+                reason = str(send_result.get("reason") or "send_failed")
+        else:
+            reason = str(common_phrase.get("reason") or "common_phrase_not_clicked")
+        success = bool(common_phrase.get("clicked") and send_result and send_result.get("sent"))
         results.append(
             {
                 "target": item,
                 "openConversation": open_result,
                 "conversationReady": readiness,
-                "fill": fill_result,
+                "fill": None,
+                "draftFill": None,
+                "commonPhrase": common_phrase,
                 "send": send_result,
-                "requestResume": request_resume,
+                "requestResume": None,
+                "candidatePrecheck": candidate_precheck,
+                "onlineResumeOpen": online_resume_open,
+                "resume": resume,
+                "analysis": analysis,
                 "closeAttachmentPreview": close_result,
                 "success": success,
-                "skipped": False,
-                "alreadySentMessage": already_sent_message,
+                "skipped": not success,
                 "reason": "" if success else reason,
             }
         )
 
     return _request_resume_new_greetings_payload(
-        job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+        job_text, message, criteria, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
         switch_status, switch_job, switch_unread, inbox, conversations, results,
     )
 
@@ -1931,6 +2113,249 @@ def _request_resume_new_greetings(
 def _sleep_operation_delay(operation_delay_seconds: float) -> None:
     if operation_delay_seconds > 0:
         time.sleep(operation_delay_seconds)
+
+
+def _analyze_candidate_precheck(
+    conversation: dict[str, Any],
+    today: date | None = None,
+    job_text: str = "",
+) -> dict[str, Any]:
+    today = today or date.today()
+    raw_text = _candidate_profile_text(conversation)
+    resolved_job_text = _conversation_job_text(conversation, job_text=job_text)
+    fresh_graduate_exempt = _is_intern_or_assistant_job(resolved_job_text)
+    reasons: list[str] = []
+    evidence: list[dict[str, Any]] = []
+
+    job_salary = _parse_salary_range(job_text)
+    candidate_salary = _parse_salary_range(str(conversation.get("salary") or raw_text))
+    if job_salary and candidate_salary and candidate_salary["max"] < job_salary["min"]:
+        reasons.append("candidate_salary_below_job_range")
+        evidence.append(
+            {
+                "type": "candidate_salary_below_job_range",
+                "jobSalary": job_salary,
+                "candidateSalary": candidate_salary,
+            }
+        )
+
+    fresh_markers = ["应届", "在校", "25年毕业", "26年毕业"]
+    matched_fresh = [marker for marker in fresh_markers if marker in raw_text]
+    matched_fresh.extend(re.findall(r"\d{2}年(?:应届|毕业)", raw_text))
+    matched_fresh = list(dict.fromkeys(matched_fresh))
+    if matched_fresh and not fresh_graduate_exempt:
+        reasons.append("fresh_graduate")
+        evidence.append({"type": "fresh_graduate", "markers": matched_fresh})
+    elif matched_fresh:
+        evidence.append(
+            {
+                "type": "fresh_graduate_ignored_for_job",
+                "markers": matched_fresh,
+                "jobText": resolved_job_text,
+            }
+        )
+
+    periods = _extract_work_periods(raw_text)
+    sorted_periods = sorted(periods, key=lambda item: item["startIndex"])
+    for previous, current in zip(sorted_periods, sorted_periods[1:]):
+        previous_end = previous.get("endIndex")
+        if previous_end is None:
+            continue
+        gap_months = int(current["startIndex"]) - int(previous_end) - 1
+        if gap_months >= 6:
+            reasons.append("work_gap_6_months_or_more")
+            evidence.append(
+                {
+                    "type": "work_gap_between_jobs",
+                    "gapMonths": gap_months,
+                    "previous": previous["raw"],
+                    "current": current["raw"],
+                }
+            )
+            break
+
+    if sorted_periods:
+        latest = max(sorted_periods, key=lambda item: item.get("endIndex") if item.get("endIndex") is not None else 10**9)
+        latest_end = latest.get("endIndex")
+        if latest_end is not None:
+            gap_months = _month_index(today.year, today.month) - int(latest_end)
+            if gap_months >= 6:
+                if "work_gap_6_months_or_more" not in reasons:
+                    reasons.append("work_gap_6_months_or_more")
+                evidence.append(
+                    {
+                        "type": "recent_work_gap",
+                        "gapMonths": gap_months,
+                        "latest": latest["raw"],
+                        "today": today.isoformat(),
+                    }
+                )
+
+    return {
+        "skip": bool(reasons),
+        "reasons": list(dict.fromkeys(reasons)),
+        "evidence": evidence,
+        "jobText": resolved_job_text,
+        "jobSalary": job_salary,
+        "candidateSalary": candidate_salary,
+        "freshGraduateCheckExempt": fresh_graduate_exempt,
+        "gapThresholdMonths": 6,
+        "profileTimeline": {
+            "rawText": raw_text,
+            "workExperiences": [
+                {
+                    "raw": item["raw"],
+                    "start": item["start"],
+                    "end": item["end"],
+                    "current": item["endIndex"] is None,
+                }
+                for item in sorted_periods
+            ],
+        },
+    }
+
+
+def _conversation_job_text(conversation: dict[str, Any], job_text: str = "") -> str:
+    values = [
+        str(job_text or ""),
+        str(conversation.get("jobTitle") or ""),
+        str(conversation.get("targetJobTitle") or ""),
+    ]
+    profile_text = _candidate_profile_text(conversation)
+    match = re.search(r"沟通职位：\s*([^\n]+)", profile_text)
+    if match:
+        values.insert(0, match.group(1).strip())
+    return " ".join(value.strip() for value in values if value and value.strip()).strip()
+
+
+def _is_intern_or_assistant_job(job_text: str) -> bool:
+    return any(marker in str(job_text or "") for marker in ("实习", "实习生", "助理"))
+
+
+def _parse_salary_range(value: str) -> dict[str, float] | None:
+    text = str(value or "")
+    match = re.search(r"(?P<min>\d+(?:\.\d+)?)\s*-\s*(?P<max>\d+(?:\.\d+)?)\s*[kK]", text)
+    if match:
+        return {
+            "raw": match.group(0),
+            "min": float(match.group("min")),
+            "max": float(match.group("max")),
+            "unit": "K",
+        }
+    match = re.search(r"(?P<min>\d+(?:\.\d+)?)\s*-\s*(?P<max>\d+(?:\.\d+)?)\s*(?:千|k|K)", text)
+    if match:
+        return {
+            "raw": match.group(0),
+            "min": float(match.group("min")),
+            "max": float(match.group("max")),
+            "unit": "K",
+        }
+    return None
+
+
+def _candidate_profile_text(conversation: dict[str, Any]) -> str:
+    profile = conversation.get("profileTimeline") or {}
+    values = [
+        str(profile.get("rawText") or ""),
+        str(conversation.get("candidateProfileText") or ""),
+        str(conversation.get("sidebarText") or ""),
+    ]
+    unique_values = list(dict.fromkeys(value for value in values if value))
+    return "\n".join(unique_values).strip()
+
+
+def _extract_work_periods(raw_text: str) -> list[dict[str, Any]]:
+    periods: list[dict[str, Any]] = []
+    lines = [line.strip() for line in str(raw_text or "").splitlines() if line.strip()]
+    period_pattern = re.compile(
+        r"(?P<start>\d{4}(?:[./年]\d{1,2})?)\s*(?:-|－|–|—|~|至|到)\s*(?P<end>至今|现在|目前|今|Present|present|在职|\d{4}(?:[./年]\d{1,2})?)"
+    )
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        matches = list(period_pattern.finditer(line))
+        if _is_standalone_period_line(line, matches):
+            date_lines: list[str] = []
+            while index < len(lines):
+                current_matches = list(period_pattern.finditer(lines[index]))
+                if not _is_standalone_period_line(lines[index], current_matches):
+                    break
+                date_lines.append(lines[index])
+                index += 1
+            description_start = index
+            for offset, date_line in enumerate(date_lines):
+                context = lines[description_start + offset] if description_start + offset < len(lines) else date_line
+                if _looks_like_education_line(context):
+                    continue
+                periods.extend(_periods_from_line(date_line, raw=context, period_pattern=period_pattern))
+            continue
+
+        value = line
+        value = line.strip()
+        if not value or _looks_like_education_line(value):
+            index += 1
+            continue
+        periods.extend(_periods_from_line(value, raw=value, period_pattern=period_pattern))
+        index += 1
+    return periods
+
+
+def _is_standalone_period_line(value: str, matches: list[re.Match[str]]) -> bool:
+    if len(matches) != 1:
+        return False
+    remaining = value.replace(matches[0].group(0), "").strip()
+    return not remaining
+
+
+def _periods_from_line(
+    value: str,
+    raw: str,
+    period_pattern: re.Pattern[str],
+) -> list[dict[str, Any]]:
+    periods: list[dict[str, Any]] = []
+    for match in period_pattern.finditer(value):
+        start = _parse_year_month(match.group("start"), default_month=1)
+        end_text = match.group("end")
+        end = None if _is_current_period_end(end_text) else _parse_year_month(end_text, default_month=12)
+        if not start:
+            continue
+        periods.append(
+            {
+                "raw": raw,
+                "start": _format_year_month(start),
+                "end": "至今" if end is None else _format_year_month(end),
+                "startIndex": _month_index(*start),
+                "endIndex": None if end is None else _month_index(*end),
+            }
+        )
+    return periods
+
+
+def _looks_like_education_line(value: str) -> bool:
+    markers = ["大学", "学院", "学校", "本科", "大专", "专科", "硕士", "博士", "专业", "教育经历"]
+    return any(marker in value for marker in markers)
+
+
+def _is_current_period_end(value: str) -> bool:
+    return str(value or "").strip().lower() in {"至今", "现在", "目前", "今", "present", "在职"}
+
+
+def _parse_year_month(value: str, default_month: int) -> tuple[int, int] | None:
+    match = re.search(r"(?P<year>\d{4})(?:[./年](?P<month>\d{1,2}))?", str(value or ""))
+    if not match:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month") or default_month)
+    month = max(1, min(12, month))
+    return year, month
+
+
+def _format_year_month(value: tuple[int, int]) -> str:
+    return f"{value[0]:04d}-{value[1]:02d}"
+
+
+def _month_index(year: int, month: int) -> int:
+    return year * 12 + month
 
 
 def _conversation_has_resume_request_or_attachment(conversation: dict[str, Any]) -> bool:
@@ -1964,6 +2389,7 @@ def _conversation_has_outbound_resume_request_text(conversation: dict[str, Any],
 def _request_resume_new_greetings_stopped(
     job_text: str,
     message: str,
+    criteria: str,
     dry_run: bool,
     inbox_scrolls: int,
     wait_after_unread: float,
@@ -1975,7 +2401,7 @@ def _request_resume_new_greetings_stopped(
     reason: str,
 ) -> dict[str, Any]:
     return _request_resume_new_greetings_payload(
-        job_text, message, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
+        job_text, message, criteria, dry_run, inbox_scrolls, wait_after_unread, operation_delay_seconds,
         switch_status, switch_job, switch_unread, inbox, [], [], reason,
     )
 
@@ -1983,6 +2409,7 @@ def _request_resume_new_greetings_stopped(
 def _request_resume_new_greetings_payload(
     job_text: str,
     message: str,
+    criteria: str,
     dry_run: bool,
     inbox_scrolls: int,
     wait_after_unread: float,
@@ -2004,6 +2431,7 @@ def _request_resume_new_greetings_payload(
     return {
         "jobText": job_text,
         "message": message,
+        "criteria": criteria,
         "dryRun": dry_run,
         "inboxScrolls": inbox_scrolls,
         "waitAfterUnread": wait_after_unread,
