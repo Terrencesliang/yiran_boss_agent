@@ -1,6 +1,6 @@
 ---
 name: boss-agent
-description: Connects to a remote-debugging Chrome session and helps extract candidate, conversation, and scoring data for Boss recruitment workflows.
+description: Controls a logged-in BOSS Chrome session for job-list traversal, AI/decision-maker screening, fixed-count communications, candidate screening, and conversation workflows. Use when the user asks to operate BOSS or invokes the fixed IT-support communication SOP.
 ---
 
 # boss-agent
@@ -10,11 +10,59 @@ Use this tool when you need to inspect an already logged-in Boss web session in 
 ## Commands
 
 - `python -m boss_agent.cli health`
+- `python -m boss_agent.cli debug open-boss`
 - `python -m boss_agent.cli debug version --endpoint http://127.0.0.1:9222`
 - `python -m boss_agent.cli debug pages --endpoint http://127.0.0.1:9222`
 - `python -m boss_agent.cli capture conversation-structured --endpoint http://127.0.0.1:9444`
 - `python -m boss_agent.cli score conversation --endpoint http://127.0.0.1:9444`
 - `python -m boss_agent.cli draft reply --endpoint http://127.0.0.1:9444`
+
+When the user says "打开 boss" or "打开BOSS", use `python -m boss_agent.cli debug open-boss` so Chrome starts with remote debugging enabled and opens the BOSS 沟通页. Use `--page recommend` when they specifically ask for 推荐牛人.
+
+## 职位页双栏遍历 SOP
+
+### 固定调用话术
+
+When the user says exactly `执行IT技术支持AI沟通SOP`, treat that phrase as explicit authorization for this single bounded sending run and execute the following SOP:
+
+1. Use the current logged-in debug Chrome page. Enter/click the top “职位” page if necessary.
+2. Click the expectation tab `IT技术支持(深圳)`; allow the shorter requested label `IT技术支持` to match its city-suffixed tab.
+3. Wait until the left job list and right detail pane are both stable.
+4. Traverse and deduplicate jobs. Extract the full job description and the visible recruiter name/role.
+5. Reject ordinary HR, HRBP, recruiters, consultants, specialists, assistants, or ambiguous identities before model work. Use the configured LLM Prompt to judge the remaining job and recruiter authority.
+6. Communicate only when the job is relevant to AI automation, Agent/RPA/workflows, LLM applications, or AI software/platform engineering; the recruiter is a supervisor, manager, director, responsible lead, founder, owner, partner, CEO/CTO/VP or equivalent; and both semantic scores are at least 75.
+7. Click “立即沟通”, wait for the success dialog, click “留在此页”, and verify the split-pane page is ready again.
+8. Wait 1.5 seconds before processing the next job. Stop after exactly 5 successful communications, list exhaustion, a security verification page, or an unrecoverable page/model error. Never bypass security verification or fall back to unjudged sending.
+
+Run:
+
+```powershell
+$env:PYTHONPATH='src'
+python -m boss_agent.cli action traverse-job-search `
+  --endpoint http://127.0.0.1:9222 `
+  --expectation "IT技术支持(深圳)" `
+  --max-count 150 `
+  --max-scrolls 80 `
+  --operation-delay-seconds 1.5 `
+  --max-communications 5 `
+  --send
+```
+
+Count only `communication.clicked=true` as a successful communication. Report each successful job title and recruiter role, plus whether `stayOnPageClicked` and `continuedOnJobPage` are true. A number other than 5 is an incomplete run and must be reported honestly with its stop reason.
+
+Use `action traverse-job-search` when the user asks to enter the homepage 职位 view and traverse the split job-list/job-detail layout:
+
+```powershell
+$env:PYTHONPATH='src'
+python -m boss_agent.cli action traverse-job-search `
+  --endpoint http://127.0.0.1:9222 `
+  --max-count 20 `
+  --max-scrolls 20 `
+  --operation-delay-seconds 1.5 `
+  --send
+```
+
+The SOP finds and clicks the visible homepage “职位” navigation button when necessary, waits until `document.readyState` is complete and both panes are stable, then clicks each left-side job card and waits for the right-side detail to settle. It records title, salary, company, location, experience, education, tags, description, recruiter name/role, raw text, and detail URL. An LLM prompt judges both job relevance (AI automation, Agent/RPA/workflow, LLM application, AI software/platform/engineering) and recruiter authority. Communication is allowed only when the visible recruiter role explicitly identifies a supervisor, manager, director, department head, founder, owner, partner, CEO/CTO/VP or equivalent decision maker, and both model scores are at least 75. Ordinary HR, HRBP, recruitment consultants, recruiters, specialists, assistants, ambiguous roles, missing LLM configuration, and LLM errors fail closed. With `--send`, the SOP clicks “立即沟通” only after both gates pass, waits for the “已向BOSS发送消息” dialog, clicks “留在此页”, confirms that the split job page is ready again, waits the configured operation delay (1.5 seconds by default), and continues with the next card. Without `--send`, it reports `wouldClick: true` without contacting anyone. Use `--model` to override `BOSS_AGENT_LLM_MODEL` and `--operation-delay-seconds` to adjust the pacing.
 
 ## 推荐牛人页筛选条件
 

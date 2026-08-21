@@ -12,6 +12,8 @@ from urllib.parse import urljoin
 from urllib.request import urlopen
 from websocket import create_connection
 
+from boss_agent.job_agent import analyze_job_for_communication
+
 
 class ChromeDebugClient:
     def __init__(self, endpoint: str, mock_dir: Path | None = None) -> None:
@@ -1004,6 +1006,434 @@ class ChromeDebugClient:
             "options": [item.get("text", "") for item in verified.get("options", []) if item.get("text")]
             or [item.get("text", "") for item in options if item.get("text")],
         }
+
+    def traverse_job_search(
+        self,
+        max_count: int = 20,
+        max_scrolls: int = 20,
+        wait_timeout_seconds: float = 15.0,
+        url_contains: str | None = "zhipin.com",
+        send: bool = False,
+        max_communications: int | None = None,
+        model: str | None = None,
+        operation_delay_seconds: float = 1.5,
+        expectation: str | None = None,
+    ) -> dict[str, Any]:
+        """Open the job-search view and traverse the left-card/right-detail layout."""
+        if max_count < 1:
+            raise ValueError("max_count must be at least 1")
+        if max_scrolls < 0:
+            raise ValueError("max_scrolls cannot be negative")
+        if wait_timeout_seconds <= 0:
+            raise ValueError("wait_timeout_seconds must be positive")
+        if max_communications is not None and max_communications < 1:
+            raise ValueError("max_communications must be at least 1")
+        if operation_delay_seconds < 0:
+            raise ValueError("operation_delay_seconds cannot be negative")
+
+        if self.mock_dir is not None:
+            jobs = [
+                {
+                    "key": "mock-ai-director",
+                    "title": "AI应用技术总监",
+                    "salary": "16-25K",
+                    "company": "璨宸科技",
+                    "location": "深圳",
+                    "experience": "3-5年",
+                    "education": "本科",
+                    "description": "负责AI自动化产品的软件开发、编码与技术架构规划。",
+                    "recruiterName": "周总",
+                    "recruiterRole": "技术总监",
+                    "semanticAnalysis": {
+                        "agent": "mock_llm",
+                        "matched": True,
+                        "communicate": True,
+                        "jobMatched": True,
+                        "decisionMaker": True,
+                        "roleEvidence": True,
+                        "jobScore": 95,
+                        "authorityScore": 95,
+                        "reason": "semantic_job_and_decision_maker_match",
+                        "rule": "LLM job relevance AND explicit recruiter decision-maker role AND both scores >= 75",
+                    },
+                    "rawText": "AI应用技术总监\n16-25K\n深圳\n3-5年\n本科",
+                },
+                {
+                    "key": "mock-architecture",
+                    "title": "国际认证架构",
+                    "salary": "18-35K",
+                    "company": "某中型物联网通信设备公司",
+                    "location": "深圳",
+                    "experience": "3-5年",
+                    "education": "本科",
+                    "description": "",
+                    "recruiterName": "李女士",
+                    "recruiterRole": "招聘顾问",
+                    "semanticAnalysis": {
+                        "agent": "mock_llm",
+                        "matched": False,
+                        "communicate": False,
+                        "jobMatched": False,
+                        "decisionMaker": False,
+                        "roleEvidence": False,
+                        "jobScore": 10,
+                        "authorityScore": 5,
+                        "reason": "semantic_criteria_not_met",
+                        "rule": "LLM job relevance AND explicit recruiter decision-maker role AND both scores >= 75",
+                    },
+                    "rawText": "国际认证架构\n18-35K\n深圳\n3-5年\n本科",
+                },
+            ][:max_count]
+            communication_total = 0
+            for job in jobs:
+                match = dict(job.pop("semanticAnalysis"))
+                job["aiWorkMatch"] = match
+                job["semanticJudgment"] = match
+                allowed_to_send = (
+                    send
+                    and match["matched"]
+                    and (max_communications is None or communication_total < max_communications)
+                )
+                job["communication"] = {
+                    "matched": match["matched"],
+                    "clicked": allowed_to_send,
+                    "dryRun": not send,
+                    "text": "立即沟通",
+                }
+                if allowed_to_send:
+                    communication_total += 1
+                if match["matched"] and not send:
+                    job["communication"]["wouldClick"] = True
+            return {
+                "started": True,
+                "ready": True,
+                "navigation": {"clicked": True, "text": "职位", "mock": True},
+                "expectationSelection": {
+                    "requested": expectation or "",
+                    "selected": bool(expectation),
+                    "text": expectation or "",
+                    "mock": True,
+                },
+                "count": len(jobs),
+                "matchedCount": sum(1 for job in jobs if job["aiWorkMatch"]["matched"]),
+                "communicationCount": sum(1 for job in jobs if job["communication"]["clicked"]),
+                "jobs": jobs,
+                "scrolls": 0,
+                "stopReason": (
+                    "max_communications"
+                    if max_communications is not None and communication_total >= max_communications
+                    else "max_count" if len(jobs) == max_count else "list_exhausted"
+                ),
+                "mock": True,
+            }
+
+        pages = self.list_pages()
+        page = self._select_page(pages, url_contains=url_contains)
+        websocket_url = page.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise ValueError("Selected page does not have webSocketDebuggerUrl")
+
+        navigation = self._evaluate_json(
+            websocket_url,
+            build_job_search_navigation_probe_expression(),
+            timeout=10,
+        )
+        if not navigation.get("ready"):
+            button = navigation.get("button")
+            if not button:
+                return {
+                    "started": False,
+                    "ready": False,
+                    "navigation": navigation,
+                    "count": 0,
+                    "jobs": [],
+                    "scrolls": 0,
+                    "stopReason": "job_button_not_found",
+                }
+            self._dispatch_mouse_click(websocket_url, button["x"], button["y"])
+            navigation = {**navigation, "clicked": True, "text": "职位"}
+
+        expectation_selection: dict[str, Any] = {
+            "requested": str(expectation or "").strip(),
+            "selected": False,
+        }
+        if expectation_selection["requested"]:
+            expectation_deadline = time.time() + wait_timeout_seconds
+            while time.time() < expectation_deadline:
+                expectation_selection = self._evaluate_json(
+                    websocket_url,
+                    build_job_search_expectation_expression(expectation_selection["requested"]),
+                    timeout=10,
+                )
+                button = expectation_selection.get("button")
+                if button:
+                    self._dispatch_mouse_click(websocket_url, button["x"], button["y"])
+                    expectation_selection = {**expectation_selection, "selected": True}
+                    if operation_delay_seconds:
+                        time.sleep(operation_delay_seconds)
+                    break
+                time.sleep(0.25)
+            if not expectation_selection.get("selected"):
+                return {
+                    "started": True,
+                    "ready": False,
+                    "navigation": navigation,
+                    "expectationSelection": expectation_selection,
+                    "count": 0,
+                    "jobs": [],
+                    "scrolls": 0,
+                    "stopReason": "expectation_not_found",
+                }
+
+        deadline = time.time() + wait_timeout_seconds
+        layout: dict[str, Any] = {}
+        stable_signature = ""
+        stable_hits = 0
+        while time.time() < deadline:
+            layout = self._evaluate_json(websocket_url, build_job_search_layout_expression(), timeout=10)
+            signature = str(layout.get("signature") or "")
+            if layout.get("ready") and signature and signature == stable_signature:
+                stable_hits += 1
+            else:
+                stable_hits = 0
+            stable_signature = signature
+            if layout.get("ready") and stable_hits >= 1:
+                break
+            time.sleep(0.25)
+
+        if not layout.get("ready"):
+            return {
+                "started": True,
+                "ready": False,
+                "navigation": navigation,
+                "layout": layout,
+                "count": 0,
+                "jobs": [],
+                "scrolls": 0,
+                "stopReason": "split_layout_timeout",
+            }
+
+        self._evaluate_json(websocket_url, build_reset_job_search_list_expression(), timeout=10)
+        time.sleep(0.4)
+
+        jobs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        scrolls = 0
+        stagnant_scrolls = 0
+        stop_reason = "list_exhausted"
+
+        while len(jobs) < max_count:
+            if max_communications is not None and sum(
+                1 for job in jobs if job.get("communication", {}).get("clicked")
+            ) >= max_communications:
+                stop_reason = "max_communications"
+                break
+            layout = self._evaluate_json(websocket_url, build_job_search_layout_expression(), timeout=10)
+            card = next(
+                (item for item in layout.get("cards", []) if str(item.get("key") or "") not in seen),
+                None,
+            )
+            if not card:
+                if scrolls >= max_scrolls:
+                    stop_reason = "max_scrolls"
+                    break
+                scroll_result = self._evaluate_json(
+                    websocket_url,
+                    build_scroll_job_search_list_expression(),
+                    timeout=10,
+                )
+                scrolls += 1
+                if scroll_result.get("moved"):
+                    stagnant_scrolls = 0
+                else:
+                    stagnant_scrolls += 1
+                if stagnant_scrolls >= 2:
+                    stop_reason = "list_exhausted"
+                    break
+                time.sleep(0.4)
+                continue
+
+            key = str(card.get("key") or "")
+            seen.add(key)
+            point = card.get("point") or {}
+            if "x" not in point or "y" not in point:
+                jobs.append(
+                    {
+                        "key": key,
+                        "title": card.get("title", ""),
+                        "rawText": card.get("text", ""),
+                        "captured": False,
+                        "reason": "card_point_not_found",
+                    }
+                )
+                continue
+
+            before_signature = str(layout.get("detailSignature") or "")
+            self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
+
+            detail_deadline = time.time() + wait_timeout_seconds
+            detail_signature = ""
+            detail_stable_hits = 0
+            detail_ready = False
+            while time.time() < detail_deadline:
+                current = self._evaluate_json(websocket_url, build_job_search_layout_expression(), timeout=10)
+                current_signature = str(current.get("detailSignature") or "")
+                active_key = str(current.get("activeKey") or "")
+                changed = bool(current_signature) and (
+                    current_signature != before_signature or active_key == key or not jobs
+                )
+                if changed and current_signature == detail_signature:
+                    detail_stable_hits += 1
+                else:
+                    detail_stable_hits = 0
+                detail_signature = current_signature
+                if changed and detail_stable_hits >= 1:
+                    detail_ready = True
+                    break
+                time.sleep(0.25)
+
+            detail = self._evaluate_json(
+                websocket_url,
+                build_capture_job_search_detail_expression(key, str(card.get("text") or "")),
+                timeout=10,
+            )
+            match = analyze_job_for_communication(detail, model=model)
+            eligible = match["matched"] and detail_ready
+            communication: dict[str, Any] = {
+                "matched": match["matched"],
+                "eligible": eligible,
+                "clicked": False,
+                "dryRun": not send,
+                "text": "立即沟通",
+            }
+            if eligible:
+                if send:
+                    communication = self._click_job_search_immediate_communication(
+                        websocket_url=websocket_url,
+                        return_url=str(layout.get("url") or page.get("url") or ""),
+                        wait_timeout_seconds=wait_timeout_seconds,
+                    )
+                else:
+                    communication["wouldClick"] = True
+            elif match["matched"]:
+                communication["reason"] = "detail_not_ready"
+            jobs.append(
+                {
+                    **detail,
+                    "key": key,
+                    "captured": detail_ready and bool(detail.get("rawText")),
+                    "detailReady": detail_ready,
+                    "aiWorkMatch": match,
+                    "semanticJudgment": match,
+                    "communication": communication,
+                }
+            )
+            if max_communications is not None and sum(
+                1 for job in jobs if job.get("communication", {}).get("clicked")
+            ) >= max_communications:
+                stop_reason = "max_communications"
+                break
+            if operation_delay_seconds:
+                time.sleep(operation_delay_seconds)
+
+        if len(jobs) >= max_count:
+            stop_reason = "max_count"
+
+        return {
+            "started": True,
+            "ready": True,
+            "navigation": navigation,
+            "expectationSelection": expectation_selection,
+            "count": len(jobs),
+            "matchedCount": sum(1 for job in jobs if job.get("aiWorkMatch", {}).get("matched")),
+            "communicationCount": sum(1 for job in jobs if job.get("communication", {}).get("clicked")),
+            "jobs": jobs,
+            "scrolls": scrolls,
+            "stopReason": stop_reason,
+            "url": layout.get("url", page.get("url", "")),
+            "sent": send,
+            "maxCommunications": max_communications,
+        }
+
+    def _click_job_search_immediate_communication(
+        self,
+        websocket_url: str,
+        return_url: str,
+        wait_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        state = self._evaluate_json(
+            websocket_url,
+            build_job_search_immediate_communication_expression(),
+            timeout=10,
+        )
+        button = state.get("button")
+        if not button:
+            return {
+                **state,
+                "matched": True,
+                "clicked": False,
+                "dryRun": False,
+                "text": "立即沟通",
+            }
+
+        self._dispatch_mouse_click(websocket_url, button["x"], button["y"])
+        result: dict[str, Any] = {
+            **state,
+            "matched": True,
+            "clicked": True,
+            "dryRun": False,
+            "text": "立即沟通",
+        }
+        time.sleep(0.8)
+
+        try:
+            layout = self._evaluate_json(websocket_url, build_job_search_layout_expression(), timeout=10)
+            result["afterClickUrl"] = layout.get("url", "")
+            recovery: dict[str, Any] = {"action": "none"}
+            recovery_deadline = time.time() + min(5.0, max(2.0, wait_timeout_seconds))
+            while time.time() < recovery_deadline:
+                recovery = self._evaluate_json(
+                    websocket_url,
+                    build_return_to_job_search_expression(return_url),
+                    timeout=10,
+                )
+                if recovery.get("stayButton") or recovery.get("closeButton"):
+                    break
+                if recovery.get("action") not in {None, "none"}:
+                    break
+                time.sleep(0.25)
+            result["recovery"] = recovery
+            stay_button = recovery.get("stayButton")
+            close_button = recovery.get("closeButton")
+            if stay_button:
+                self._dispatch_mouse_click(websocket_url, stay_button["x"], stay_button["y"])
+                result["stayOnPageClicked"] = True
+                time.sleep(0.4)
+            elif close_button:
+                self._dispatch_mouse_click(websocket_url, close_button["x"], close_button["y"])
+                time.sleep(0.4)
+            elif layout.get("ready") and recovery.get("action") == "none":
+                result["continuedOnJobPage"] = True
+                return result
+
+            deadline = time.time() + wait_timeout_seconds
+            while time.time() < deadline:
+                recovered = self._evaluate_json(websocket_url, build_job_search_layout_expression(), timeout=10)
+                if recovered.get("ready"):
+                    result["continuedOnJobPage"] = True
+                    result["recoveredUrl"] = recovered.get("url", "")
+                    return result
+                time.sleep(0.25)
+            result["continuedOnJobPage"] = False
+            result["reason"] = "job_page_recovery_timeout"
+            return result
+        except Exception as exc:
+            return {
+                **result,
+                "continuedOnJobPage": False,
+                "reason": "post_click_state_failed",
+                "error": str(exc),
+            }
 
     def capture_recommend_job_filter_options(self, url_contains: str | None = "/web/chat/recommend") -> dict[str, Any]:
         if self.mock_dir is not None:
@@ -4048,28 +4478,535 @@ class ChromeDebugClient:
         return json.loads(result)
 
 
+def match_job_description_for_ai_work(description: str) -> dict[str, Any]:
+    normalized = " ".join(str(description or "").lower().split())
+    ai_terms = (
+        "人工智能", "大模型", "aigc", "llm", "机器学习", "深度学习",
+        "自然语言处理", "计算机视觉", "具身智能", "生成式ai", "智能体",
+        "gpt", "copilot", "agent", "ai",
+    )
+    automation_terms = (
+        "自动化", "rpa", "工作流", "流程编排", "机器人流程自动化",
+        "智能体", "agent", "低代码",
+    )
+    development_terms = (
+        "软件开发", "软件工程", "系统开发", "应用开发", "平台开发",
+        "后端开发", "前端开发", "全栈", "算法开发", "python", "java",
+        "c++", "编程", "编码", "研发", "工程化", "api",
+    )
+
+    def matched_terms(terms: tuple[str, ...]) -> list[str]:
+        matches: list[str] = []
+        for term in terms:
+            if term in {"ai", "api", "llm", "rpa", "gpt", "copilot", "agent", "java", "python"}:
+                if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", normalized):
+                    matches.append(term)
+            elif term in normalized:
+                matches.append(term)
+        return matches
+
+    ai_matches = matched_terms(ai_terms)
+    automation_matches = matched_terms(automation_terms)
+    development_matches = matched_terms(development_terms)
+    matched = bool(ai_matches and (automation_matches or development_matches))
+    return {
+        "matched": matched,
+        "rule": "AI AND (automation OR software development)",
+        "aiTerms": ai_matches,
+        "automationTerms": automation_matches,
+        "developmentTerms": development_matches,
+        "reason": "ai_automation_or_software_development" if matched else "criteria_not_met",
+    }
+
+
+def build_job_search_expectation_expression(expectation: str) -> str:
+    expression = r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const expected = clean(__EXPECTATION__);
+  const candidates = Array.from(document.querySelectorAll(
+    '.expect-item, a, button, [role="button"], span'
+  )).filter(isVisible).map((el) => ({ el, text: clean(el.innerText || el.textContent) }))
+    .filter((item) => item.text && item.text.length <= 80);
+  const matched = candidates.find((item) => item.text === expected)
+    || candidates.find((item) => !expected.includes('(') && item.text.startsWith(`${expected}(`));
+  const target = matched && (matched.el.closest('a, button, [role="button"]') || matched.el);
+  if (!target) {
+    return JSON.stringify({
+      found: false,
+      selected: false,
+      requested: expected,
+      reason: 'expectation_not_found',
+      candidates: candidates.map((item) => item.text)
+        .filter((text) => text.includes(expected) || expected.includes(text)).slice(0, 20)
+    });
+  }
+  const rect = target.getBoundingClientRect();
+  return JSON.stringify({
+    found: true,
+    selected: false,
+    requested: expected,
+    text: clean(target.innerText || target.textContent),
+    button: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  });
+})()
+""".strip()
+    return expression.replace("__EXPECTATION__", json.dumps(expectation, ensure_ascii=False))
+
+
+def build_job_search_navigation_probe_expression() -> str:
+    return r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const cardSelector = '.job-card-wrapper, .job-card-box, .job-list-item, [class*="job-card"]';
+  const detailSelector = '.job-detail-box, .job-detail, .job-detail-container, [class*="job-detail"]';
+  const cards = Array.from(document.querySelectorAll(cardSelector)).filter(isVisible);
+  const details = Array.from(document.querySelectorAll(detailSelector)).filter(isVisible);
+  const ready = cards.length > 0 && details.length > 0;
+  if (ready) {
+    return JSON.stringify({ ready: true, clicked: false, reason: 'already_on_job_search', url: location.href });
+  }
+  const firstVisibleCard = cards.find((el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+  });
+  if (firstVisibleCard && details.length === 0) {
+    const rect = firstVisibleCard.getBoundingClientRect();
+    return JSON.stringify({
+      ready: false,
+      clicked: false,
+      reason: 'select_first_job',
+      url: location.href,
+      button: {
+        x: (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2,
+        y: (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2
+      }
+    });
+  }
+
+  const candidates = Array.from(document.querySelectorAll('a, button, [role="button"], li, span'))
+    .filter((el) => isVisible(el) && clean(el.textContent) === '职位')
+    .filter((el) => !el.closest(cardSelector));
+  const target = candidates
+    .map((el) => el.closest('a, button, [role="button"], li') || el)
+    .sort((a, b) => {
+      const rank = (el) => (el.closest('header, nav, [class*="header"], [class*="nav"]') ? 0 : 1);
+      return rank(a) - rank(b);
+    })[0];
+  if (!target) {
+    return JSON.stringify({
+      ready: false,
+      clicked: false,
+      reason: 'job_button_not_found',
+      url: location.href,
+      visibleNavigation: Array.from(document.querySelectorAll('header a, nav a, [class*="nav"] a'))
+        .filter(isVisible).map((el) => clean(el.textContent)).filter(Boolean).slice(0, 30)
+    });
+  }
+  const rect = target.getBoundingClientRect();
+  return JSON.stringify({
+    ready: false,
+    clicked: false,
+    reason: 'navigation_required',
+    url: location.href,
+    button: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  });
+})()
+""".strip()
+
+
+def build_job_search_keyword_probe_expression(keyword: str) -> str:
+    expression = r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+  const input = inputs.find((el) => /搜索职位|公司|职位/.test(el.placeholder || ''))
+    || inputs.find((el) => ['search', 'text'].includes(el.type || 'text'));
+  if (!input) return JSON.stringify({ ready: false, reason: 'search_input_not_found' });
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(input, __KEYWORD__);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  const root = input.closest('form, [class*="search"]') || document;
+  const candidates = Array.from(root.querySelectorAll('button, a, [role="button"]')).filter(isVisible);
+  const button = candidates.find((el) => clean(el.innerText || el.textContent) === '搜索');
+  if (!button) return JSON.stringify({ ready: false, reason: 'search_button_not_found', value: input.value });
+  const rect = button.getBoundingClientRect();
+  return JSON.stringify({
+    ready: true,
+    value: input.value,
+    button: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  });
+})()
+""".strip()
+    return expression.replace("__KEYWORD__", json.dumps(keyword, ensure_ascii=False))
+
+
+def build_job_search_layout_expression() -> str:
+    return r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const cardSelector = [
+    '.job-card-wrapper', '.job-card-box', '.job-list-item',
+    '.job-list li', '.job-list-box li', '[class*="job-card"]'
+  ].join(', ');
+  const allCards = Array.from(document.querySelectorAll(cardSelector)).filter((el) => {
+    if (!isVisible(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+  });
+  const cardSet = new Set(allCards);
+  const cards = allCards.filter((el) => {
+    let parent = el.parentElement;
+    while (parent) {
+      if (cardSet.has(parent)) return false;
+      parent = parent.parentElement;
+    }
+    return clean(el.innerText || el.textContent).length >= 4;
+  });
+  const details = Array.from(document.querySelectorAll(
+    '.job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap, [class*="job-detail"]'
+  )).filter(isVisible).sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (br.width * br.height) - (ar.width * ar.height);
+  });
+  const detail = details[0] || null;
+  const payloadCards = cards.map((el, index) => {
+    const rect = el.getBoundingClientRect();
+    const text = clean(el.innerText || el.textContent);
+    const link = el.querySelector('a[href]');
+    const key = clean(
+      el.getAttribute('data-jobid') || el.getAttribute('data-job-id') ||
+      el.getAttribute('data-id') || el.getAttribute('ka') ||
+      (link && link.href) || text.slice(0, 240)
+    );
+    const titleNode = el.querySelector('.job-name, .job-title, [class*="job-name"], h3, h4');
+    const active = el.matches('.active, .selected, [aria-selected="true"]')
+      || Boolean(el.querySelector('.active, .selected, [aria-selected="true"]'));
+    return {
+      key: key || `card-${index}`,
+      title: clean(titleNode ? titleNode.textContent : text.split(' ')[0]),
+      text,
+      active,
+      point: {
+        x: (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2,
+        y: (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2
+      }
+    };
+  });
+  const detailText = detail ? clean(detail.innerText || detail.textContent) : '';
+  const activeCard = payloadCards.find((item) => item.active);
+  const signature = `${document.readyState}|${payloadCards.length}|${detailText.slice(0, 400)}`;
+  return JSON.stringify({
+    ready: document.readyState === 'complete' && payloadCards.length > 0 && Boolean(detail) && detailText.length > 0,
+    readyState: document.readyState,
+    url: location.href,
+    cards: payloadCards,
+    cardCount: payloadCards.length,
+    activeKey: activeCard ? activeCard.key : '',
+    detailSignature: detailText.slice(0, 500),
+    signature
+  });
+})()
+""".strip()
+
+
+def build_scroll_job_search_list_expression() -> str:
+    return r"""
+(() => {
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const card = Array.from(document.querySelectorAll(
+    '.job-card-wrapper, .job-card-box, .job-list-item, .job-list li, .job-list-box li, [class*="job-card"]'
+  )).find(isVisible);
+  let scroller = card ? card.parentElement : null;
+  while (scroller && scroller !== document.body) {
+    const style = getComputedStyle(scroller);
+    if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 2) break;
+    scroller = scroller.parentElement;
+  }
+  if (!scroller || scroller === document.body) scroller = document.scrollingElement || document.documentElement;
+  const before = scroller.scrollTop;
+  const amount = Math.max(240, Math.floor((scroller.clientHeight || innerHeight) * 0.75));
+  scroller.scrollTop = Math.min(scroller.scrollHeight, before + amount);
+  scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+  return JSON.stringify({
+    moved: scroller.scrollTop > before,
+    before,
+    after: scroller.scrollTop,
+    max: Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+  });
+})()
+""".strip()
+
+
+def build_reset_job_search_list_expression() -> str:
+    return r"""
+(() => {
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const card = Array.from(document.querySelectorAll(
+    '.job-card-wrapper, .job-card-box, .job-list-item, .job-list li, .job-list-box li, [class*="job-card"]'
+  )).find(isVisible);
+  let scroller = card ? card.parentElement : null;
+  while (scroller && scroller !== document.body) {
+    const style = getComputedStyle(scroller);
+    if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 2) break;
+    scroller = scroller.parentElement;
+  }
+  if (!scroller || scroller === document.body) scroller = document.scrollingElement || document.documentElement;
+  const before = scroller.scrollTop;
+  scroller.scrollTop = 0;
+  scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+  return JSON.stringify({ reset: true, before, after: scroller.scrollTop });
+})()
+""".strip()
+
+
+def build_capture_job_search_detail_expression(card_key: str, card_text: str) -> str:
+    expression = r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const lines = (value) => String(value || '').split(/\n+/).map(clean).filter(Boolean);
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const details = Array.from(document.querySelectorAll(
+    '.job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap, [class*="job-detail"]'
+  )).filter(isVisible).sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (br.width * br.height) - (ar.width * ar.height);
+  });
+  const detail = details[0] || null;
+  const rawText = detail ? String(detail.innerText || detail.textContent || '').trim() : '';
+  const detailLines = lines(rawText);
+  const cardLines = lines(__CARD_TEXT__);
+  const pick = (selectors) => {
+    if (!detail) return '';
+    for (const selector of selectors) {
+      const node = Array.from(detail.querySelectorAll(selector)).find(isVisible);
+      const value = clean(node && (node.innerText || node.textContent));
+      if (value) return value;
+    }
+    return '';
+  };
+  const salaryPattern = /(?:\d+(?:\.\d+)?[-~—]\d+(?:\.\d+)?K|\d+K以上|薪资面议)/i;
+  const experiencePattern = /(?:经验不限|应届生|在校生|\d+年以内|\d+[-~—]\d+年|\d+年以上)/;
+  const educationPattern = /(?:学历不限|初中|中专\/中技|高中|大专|本科|硕士|博士)/;
+  const salary = pick(['.salary', '.job-salary', '[class*="salary"]'])
+    || [...detailLines, ...cardLines].find((line) => salaryPattern.test(line)) || '';
+  const experience = [...detailLines.slice(0, 20), ...cardLines].find((line) => experiencePattern.test(line)) || '';
+  const education = [...detailLines.slice(0, 20), ...cardLines].find((line) => educationPattern.test(line)) || '';
+  const title = pick(['.job-name', '.job-title', '[class*="job-name"]', 'h1', 'h2']) || cardLines[0] || '';
+  const company = pick(['.company-name', '.company-info a', '[class*="company-name"]']);
+  const locationText = pick(['.job-address', '.location-address', '[class*="location"]'])
+    || detailLines.find((line) => /北京|上海|深圳|广州|杭州|成都|武汉|南京|苏州|重庆|西安/.test(line)) || '';
+  const description = pick([
+    '.job-sec-text', '.job-description', '.job-detail-section',
+    '[class*="job-description"]', '[class*="job-sec-text"]'
+  ]);
+  const tags = detail ? Array.from(detail.querySelectorAll(
+    '.job-tags span, .job-tag, [class*="job-tag"] span, [class*="tag-list"] span'
+  )).filter(isVisible).map((el) => clean(el.textContent)).filter(Boolean) : [];
+  const actionTexts = detail ? Array.from(detail.querySelectorAll('button, a, [role="button"]'))
+    .filter(isVisible)
+    .map((el) => clean(el.innerText || el.textContent))
+    .filter((value) => ['立即沟通', '继续沟通', '已沟通'].includes(value)) : [];
+  const recruiterBox = detail && detail.querySelector('.job-boss-info');
+  const recruiterNameNode = recruiterBox && recruiterBox.querySelector('.name');
+  let recruiterName = '';
+  if (recruiterNameNode) {
+    const clone = recruiterNameNode.cloneNode(true);
+    clone.querySelectorAll('*').forEach((node) => node.remove());
+    recruiterName = clean(clone.textContent);
+  }
+  const recruiterAttr = clean(recruiterBox && recruiterBox.querySelector('.boss-info-attr')?.textContent);
+  const recruiterParts = recruiterAttr.split(/\s*[·]\s*/).map(clean).filter(Boolean);
+  const recruiterRole = recruiterParts.length > 1 ? recruiterParts[recruiterParts.length - 1] : '';
+  const recruiterCompany = recruiterParts.length > 1 ? recruiterParts.slice(0, -1).join(' · ') : '';
+  const link = detail && detail.querySelector('a[href*="job_detail"], a[href*="/job/"]');
+  return JSON.stringify({
+    key: __CARD_KEY__, title, salary, company, location: locationText, experience, education,
+    tags: Array.from(new Set(tags)), actionTexts: Array.from(new Set(actionTexts)), description, rawText,
+    recruiterName, recruiterRole, recruiterCompany,
+    detailUrl: link ? link.href : window.location.href
+  });
+})()
+""".strip()
+    return expression.replace("__CARD_KEY__", json.dumps(card_key, ensure_ascii=False)).replace(
+        "__CARD_TEXT__",
+        json.dumps(card_text, ensure_ascii=False),
+    )
+
+
+def build_job_search_immediate_communication_expression() -> str:
+    return r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const details = Array.from(document.querySelectorAll(
+    '.job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap, [class*="job-detail"]'
+  )).filter(isVisible).sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (br.width * br.height) - (ar.width * ar.height);
+  });
+  const detail = details[0] || document.body;
+  const buttons = Array.from(detail.querySelectorAll('button, a, [role="button"]')).filter(isVisible);
+  const target = buttons.find((el) => clean(el.innerText || el.textContent) === '立即沟通');
+  if (!target) {
+    return JSON.stringify({
+      found: false,
+      reason: 'immediate_communication_button_not_found',
+      visibleButtons: buttons.map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, 30),
+      url: location.href
+    });
+  }
+  const rect = target.getBoundingClientRect();
+  return JSON.stringify({
+    found: true,
+    url: location.href,
+    button: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+    text: '立即沟通'
+  });
+})()
+""".strip()
+
+
+def build_return_to_job_search_expression(return_url: str) -> str:
+    expression = r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const returnUrl = __RETURN_URL__;
+  const stayCandidate = Array.from(document.querySelectorAll(
+    'button, a, [role="button"], span, div'
+  )).find((el) => isVisible(el) && clean(el.innerText || el.textContent) === '留在此页');
+  const stay = stayCandidate
+    ? (stayCandidate.closest('button, a, [role="button"]') || stayCandidate)
+    : null;
+  if (stay) {
+    const rect = stay.getBoundingClientRect();
+    return JSON.stringify({
+      action: 'stay_on_page',
+      stayButton: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+      text: '留在此页'
+    });
+  }
+  if (returnUrl && location.href !== returnUrl && history.length > 1) {
+    history.back();
+    return JSON.stringify({ action: 'history_back', from: location.href, to: returnUrl });
+  }
+  const modal = Array.from(document.querySelectorAll(
+    '[role="dialog"], .boss-dialog, .dialog-wrap, .boss-popup__wrapper, .modal'
+  )).filter(isVisible).sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (br.width * br.height) - (ar.width * ar.height);
+  })[0];
+  const close = modal && Array.from(modal.querySelectorAll(
+    '.boss-popup__close, .close, .close-btn, [aria-label="关闭"], [aria-label="Close"]'
+  )).find(isVisible);
+  if (close) {
+    const rect = close.getBoundingClientRect();
+    return JSON.stringify({
+      action: 'close_overlay',
+      closeButton: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+    });
+  }
+  if (returnUrl && location.href !== returnUrl) {
+    location.href = returnUrl;
+    return JSON.stringify({ action: 'navigate_back', to: returnUrl });
+  }
+  return JSON.stringify({ action: 'none', url: location.href });
+})()
+""".strip()
+    return expression.replace("__RETURN_URL__", json.dumps(return_url, ensure_ascii=False))
+
+
 def build_chrome_launch_command(
     chrome_path: Path,
     user_data_dir: Path,
     port: int,
+    urls: list[str] | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(chrome_path),
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
         f"--user-data-dir={user_data_dir}",
     ]
+    command.extend(urls or [])
+    return command
 
 
 def launch_chrome(
     chrome_path: Path,
     user_data_dir: Path,
     port: int,
+    urls: list[str] | None = None,
 ) -> list[str]:
     command = build_chrome_launch_command(
         chrome_path=chrome_path,
         user_data_dir=user_data_dir,
         port=port,
+        urls=urls,
     )
     user_data_dir.mkdir(parents=True, exist_ok=True)
     subprocess.Popen(command)

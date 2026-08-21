@@ -24,6 +24,7 @@ from boss_agent.scoring import score_conversation
 from boss_agent.knowledge_base import answer_question_from_knowledge_detailed
 from boss_agent.knowledge_base import load_knowledge_base
 from boss_agent.knowledge_base import normalize_text
+from boss_agent.job_agent import load_local_llm_env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,6 +138,19 @@ def build_parser() -> argparse.ArgumentParser:
     switch_job_filter_parser.add_argument("--mock-dir")
     switch_job_filter_parser.add_argument("--url-contains", default="/web/chat/index")
     switch_job_filter_parser.add_argument("--job-text", required=True)
+
+    traverse_job_search_parser = action_subparsers.add_parser("traverse-job-search")
+    traverse_job_search_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
+    traverse_job_search_parser.add_argument("--mock-dir")
+    traverse_job_search_parser.add_argument("--url-contains", default="zhipin.com")
+    traverse_job_search_parser.add_argument("--max-count", type=int, default=20)
+    traverse_job_search_parser.add_argument("--max-scrolls", type=int, default=20)
+    traverse_job_search_parser.add_argument("--wait-timeout-seconds", type=float, default=15.0)
+    traverse_job_search_parser.add_argument("--send", action="store_true")
+    traverse_job_search_parser.add_argument("--max-communications", type=int)
+    traverse_job_search_parser.add_argument("--model")
+    traverse_job_search_parser.add_argument("--operation-delay-seconds", type=float, default=1.5)
+    traverse_job_search_parser.add_argument("--expectation")
 
     process_unread_parser = action_subparsers.add_parser("process-unread")
     process_unread_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
@@ -295,6 +309,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch_parser.add_argument("--port", type=int, default=9222)
     launch_parser.add_argument("--dry-run", action="store_true")
+
+    open_boss_parser = debug_subparsers.add_parser("open-boss")
+    open_boss_parser.add_argument(
+        "--chrome-path",
+        default=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    )
+    open_boss_parser.add_argument(
+        "--user-data-dir",
+        default=str((Path.cwd() / ".chrome-profile").resolve()),
+    )
+    open_boss_parser.add_argument("--port", type=int, default=9222)
+    open_boss_parser.add_argument(
+        "--page",
+        choices=["recommend", "chat"],
+        default="chat",
+    )
+    open_boss_parser.add_argument("--url")
+    open_boss_parser.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -457,6 +489,23 @@ def main(argv: list[str] | None = None) -> int:
                 client.switch_job_filter(
                     job_text=args.job_text,
                     url_contains=args.url_contains,
+                )
+            )
+        if args.action_command == "traverse-job-search":
+            load_local_llm_env()
+            fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
+            client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
+            return _print_json(
+                client.traverse_job_search(
+                    max_count=args.max_count,
+                    max_scrolls=args.max_scrolls,
+                    wait_timeout_seconds=args.wait_timeout_seconds,
+                    url_contains=args.url_contains,
+                    send=args.send,
+                    max_communications=args.max_communications,
+                    model=args.model,
+                    operation_delay_seconds=args.operation_delay_seconds,
+                    expectation=args.expectation,
                 )
             )
         if args.action_command == "process-unread":
@@ -797,6 +846,40 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "action": "launch",
                     "port": args.port,
+                    "chromePath": str(chrome_path),
+                    "userDataDir": str(user_data_dir),
+                    "command": command,
+                }
+            )
+
+        if args.debug_command == "open-boss":
+            chrome_path = Path(args.chrome_path)
+            user_data_dir = Path(args.user_data_dir)
+            page_urls = {
+                "recommend": "https://www.zhipin.com/web/chat/recommend",
+                "chat": "https://www.zhipin.com/web/chat/index",
+            }
+            url = args.url or page_urls[args.page]
+            if args.dry_run:
+                command = build_chrome_launch_command(
+                    chrome_path=chrome_path,
+                    user_data_dir=user_data_dir,
+                    port=args.port,
+                    urls=[url],
+                )
+            else:
+                command = launch_chrome(
+                    chrome_path=chrome_path,
+                    user_data_dir=user_data_dir,
+                    port=args.port,
+                    urls=[url],
+                )
+            return _print_json(
+                {
+                    "action": "open-boss",
+                    "port": args.port,
+                    "page": args.page,
+                    "url": url,
                     "chromePath": str(chrome_path),
                     "userDataDir": str(user_data_dir),
                     "command": command,

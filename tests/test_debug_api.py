@@ -12,7 +12,15 @@ from boss_agent.chrome_debug import build_capture_conversation_expression
 from boss_agent.chrome_debug import build_dismiss_recommend_popup_cards_expression
 from boss_agent.chrome_debug import build_download_click_probe_expression
 from boss_agent.chrome_debug import build_chrome_launch_command
+from boss_agent.chrome_debug import build_capture_job_search_detail_expression
+from boss_agent.chrome_debug import build_job_search_layout_expression
+from boss_agent.chrome_debug import build_job_search_immediate_communication_expression
+from boss_agent.chrome_debug import build_job_search_expectation_expression
+from boss_agent.chrome_debug import build_job_search_navigation_probe_expression
+from boss_agent.chrome_debug import build_return_to_job_search_expression
+from boss_agent.chrome_debug import build_scroll_job_search_list_expression
 from boss_agent.chrome_debug import classify_page
+from boss_agent.chrome_debug import match_job_description_for_ai_work
 from boss_agent.cli import _load_screen_recommend_detail_config
 from boss_agent.cli import _format_keyword_evidence
 from boss_agent.cli import _analyze_candidate_precheck
@@ -680,6 +688,106 @@ def test_switch_job_filter_from_mock_returns_selected_job() -> None:
 
     assert result["switched"] is True
     assert result["selected"] == "销售 _ 广州 8-12K"
+
+
+def test_traverse_job_search_from_mock_returns_split_pane_details() -> None:
+    client = ChromeDebugClient(
+        endpoint="http://127.0.0.1:9222",
+        mock_dir=FIXTURES,
+    )
+
+    result = client.traverse_job_search(max_count=1)
+
+    assert result["started"] is True
+    assert result["ready"] is True
+    assert result["count"] == 1
+    assert result["jobs"][0]["title"] == "AI应用技术总监"
+    assert result["jobs"][0]["salary"] == "16-25K"
+    assert result["jobs"][0]["aiWorkMatch"]["matched"] is True
+    assert result["jobs"][0]["communication"]["wouldClick"] is True
+    assert result["stopReason"] == "max_count"
+
+
+def test_job_search_expressions_cover_navigation_layout_scroll_and_detail() -> None:
+    navigation = build_job_search_navigation_probe_expression()
+    expectation = build_job_search_expectation_expression("IT技术支持(深圳)")
+    layout = build_job_search_layout_expression()
+    scroll = build_scroll_job_search_list_expression()
+    detail = build_capture_job_search_detail_expression("job-1", "AI应用技术总监\n16-25K")
+    communicate = build_job_search_immediate_communication_expression()
+    recovery = build_return_to_job_search_expression("https://www.zhipin.com/web/geek/jobs")
+
+    assert "job_button_not_found" in navigation
+    assert "IT技术支持(深圳)" in expectation
+    assert "expectation_not_found" in expectation
+    assert "document.readyState === 'complete'" in layout
+    assert "detailSignature" in layout
+    assert "scroller.scrollTop" in scroll
+    assert '"job-1"' in detail
+    assert "AI应用技术总监" in detail
+    assert "立即沟通" in communicate
+    assert "history.back()" in recovery
+    assert "留在此页" in recovery
+
+
+def test_match_job_description_requires_ai_and_automation_or_development() -> None:
+    automation = match_job_description_for_ai_work("负责大模型 Agent 工作流自动化和流程编排")
+    development = match_job_description_for_ai_work("负责 AI 应用的软件开发、Python 编码和工程化")
+    unrelated_automation = match_job_description_for_ai_work("负责财务RPA自动化流程维护")
+    ai_only = match_job_description_for_ai_work("关注人工智能行业发展趋势和产品规划")
+
+    assert automation["matched"] is True
+    assert development["matched"] is True
+    assert unrelated_automation["matched"] is False
+    assert ai_only["matched"] is False
+
+
+def test_traverse_job_search_send_clicks_only_matching_mock_job() -> None:
+    client = ChromeDebugClient(endpoint="http://127.0.0.1:9222", mock_dir=FIXTURES)
+
+    result = client.traverse_job_search(max_count=2, send=True)
+
+    assert result["matchedCount"] == 1
+    assert result["communicationCount"] == 1
+    assert result["jobs"][0]["communication"]["clicked"] is True
+    assert result["jobs"][1]["communication"]["clicked"] is False
+
+
+def test_immediate_communication_clicks_stay_on_page_before_continuing() -> None:
+    class StayOnPageClient(ChromeDebugClient):
+        def __init__(self) -> None:
+            super().__init__(endpoint="http://127.0.0.1:9222")
+            self.clicks: list[tuple[float, float]] = []
+            self.layout_reads = 0
+
+        def _evaluate_json(self, websocket_url: str, expression: str, timeout: float = 5) -> dict:
+            if "immediate_communication_button_not_found" in expression:
+                return {"found": True, "button": {"x": 100, "y": 50}, "text": "立即沟通"}
+            if "stay_on_page" in expression:
+                return {"action": "stay_on_page", "stayButton": {"x": 80, "y": 40}, "text": "留在此页"}
+            if "detailSignature" in expression:
+                self.layout_reads += 1
+                return {
+                    "ready": self.layout_reads > 1,
+                    "url": "https://www.zhipin.com/web/geek/jobs",
+                }
+            raise AssertionError("unexpected expression")
+
+        def _dispatch_mouse_click(self, websocket_url: str, x: float, y: float) -> None:
+            self.clicks.append((x, y))
+
+    client = StayOnPageClient()
+
+    result = client._click_job_search_immediate_communication(
+        websocket_url="ws://mock",
+        return_url="https://www.zhipin.com/web/geek/jobs",
+        wait_timeout_seconds=1,
+    )
+
+    assert result["clicked"] is True
+    assert result["stayOnPageClicked"] is True
+    assert result["continuedOnJobPage"] is True
+    assert client.clicks == [(100, 50), (80, 40)]
 
 
 def test_switch_conversation_status_tab_from_mock_matches_new_greeting_count() -> None:

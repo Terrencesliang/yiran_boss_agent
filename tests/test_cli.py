@@ -68,6 +68,45 @@ def test_debug_launch_command_reports_launch_configuration() -> None:
     assert "--user-data-dir=D:\\BOSS直聘\\boss-agent\\.chrome-profile" in payload["command"]
 
 
+def test_debug_open_boss_uses_debug_chrome_and_default_chat_url() -> None:
+    result = run_cli(
+        "debug",
+        "open-boss",
+        "--chrome-path",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "--user-data-dir",
+        r"C:\tmp\boss-agent\.chrome-profile",
+        "--port",
+        "9333",
+        "--dry-run",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "open-boss"
+    assert payload["page"] == "chat"
+    assert payload["url"] == "https://www.zhipin.com/web/chat/index"
+    assert "--remote-debugging-port=9333" in payload["command"]
+    assert "--remote-allow-origins=*" in payload["command"]
+    assert "https://www.zhipin.com/web/chat/index" in payload["command"]
+
+
+def test_debug_open_boss_can_open_recommend_page() -> None:
+    result = run_cli(
+        "debug",
+        "open-boss",
+        "--page",
+        "recommend",
+        "--dry-run",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["page"] == "recommend"
+    assert payload["url"] == "https://www.zhipin.com/web/chat/recommend"
+    assert "https://www.zhipin.com/web/chat/recommend" in payload["command"]
+
+
 def test_debug_detect_page_reports_boss_page_metadata() -> None:
     result = run_cli(
         "debug",
@@ -261,6 +300,50 @@ def test_action_switch_job_filter_returns_selected_job() -> None:
     payload = json.loads(result.stdout)
     assert payload["switched"] is True
     assert payload["selected"] == "销售 _ 广州 8-12K"
+
+
+def test_action_traverse_job_search_runs_split_pane_sop() -> None:
+    result = run_cli(
+        "action",
+        "traverse-job-search",
+        "--mock-dir",
+        "tests/fixtures",
+        "--max-count",
+        "1",
+        "--expectation",
+        "IT技术支持(深圳)",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["ready"] is True
+    assert payload["navigation"]["text"] == "职位"
+    assert payload["expectationSelection"]["selected"] is True
+    assert payload["expectationSelection"]["text"] == "IT技术支持(深圳)"
+    assert payload["count"] == 1
+    assert payload["jobs"][0]["title"] == "AI应用技术总监"
+    assert payload["jobs"][0]["communication"]["wouldClick"] is True
+
+
+def test_action_traverse_job_search_send_contacts_matching_jobs() -> None:
+    result = run_cli(
+        "action",
+        "traverse-job-search",
+        "--mock-dir",
+        "tests/fixtures",
+        "--max-count",
+        "2",
+        "--send",
+        "--max-communications",
+        "1",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["matchedCount"] == 1
+    assert payload["communicationCount"] == 1
+    assert payload["jobs"][0]["communication"]["clicked"] is True
+    assert payload["stopReason"] == "max_communications"
 
 
 def test_action_filter_recommendations_returns_analysis() -> None:
