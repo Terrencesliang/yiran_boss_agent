@@ -2,6 +2,20 @@
 
 用于连接已开启远程调试的 Chrome 会话，逐步构建 Boss 招聘辅助助手。
 
+## 招聘任务解析与预览
+
+- 从当前指令开始，用 `plan-recruitment --request "原始指令"` 查看确定性规则的解析结果和阻断项。原文未包含岗位时，用 `--job-context "当前岗位"` 明确提供岗位。计划命令不会采集候选人。兼容旧调用时，需看 JSON 的 `plan.blockers`，仅看退出码无法判断计划是否就绪。
+- 从原文运行模拟预览，用 `action screen-recommend-detail --request "原始指令" --job-context "当前岗位" --mock-dir <夹具目录> --report-path <新报告.json>`。旧 `--task-file` 入口仍可显式导入。工具不查找或自动选用历史任务。
+- 成功、阻断与执行中止的结构化入口记录分别写入 `reports/recruitment_runs`，也可用 `BOSS_RECRUITMENT_AUDIT_DIR` 指定目录。记录含原始指令或显式导入文件哈希、解析、最终执行配置及阶段状态。
+- 离线评估可用 `evaluate-recruitment --request "原始指令" --candidates <简历证据.json> --sample-kind synthetic`。已脱敏的真实样本单独使用 `real-deidentified`，分别运行和统计。旧调用默认标为 `unclassified`。
+- `--use-llm` 用于简历证据判断，任务生成仍使用确定性规则。LLM 任务理解评估应在独立影子流程完成。
+
+## 本科专业目录维护
+
+专业映射集中在 `src/boss_agent/undergraduate_majors.json`。目录记录教育部版本、源 PDF 和校验哈希，按专业代码连接专业名、专业类和学科门类。2026 版包含 13 个门类、92 个专业类和 883 个专业。交叉学科下未列专业类的条目保留门类，专业类留空。
+
+更新时依据新版正式目录同步更新版本、来源、哈希和代码表。只在 `aliases` 中维护能唯一对应到目录名称的简称。岗位准入、专业例外和优先项由招聘任务配置。验证时覆盖跨门类专业、别名和未收录值。
+
 ## Current Scope
 
 - `health`: 输出服务状态

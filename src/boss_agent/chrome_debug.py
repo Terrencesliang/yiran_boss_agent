@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 from urllib.request import urlopen
+from uuid import uuid4
 from websocket import create_connection
 
+from boss_agent.contact_policy import CONFIRMED_CONTACT_STATES, blocked_contact
 from boss_agent.job_agent import analyze_job_for_communication
 
 
@@ -21,6 +23,10 @@ class ChromeDebugClient:
         self.mock_dir = mock_dir
         self._message_id = 0
         self._mock_current_candidate_id = ""
+        self._recommend_page_id: str | None = None
+        self._mock_recommend_viewport = 0
+        self._recommend_binding_token: str | None = None
+        self._recommend_focus_socket = None
 
     def version(self) -> dict[str, Any]:
         return self._get_json("/json/version", "version.json")
@@ -1441,6 +1447,10 @@ class ChromeDebugClient:
                 "selected": "\u7535\u5546\u8fd0\u8425\u7ecf\u7406\uff08\u7f8e\u5986\uff09",
                 "opened": False,
                 "options": ["\u7535\u5546\u8fd0\u8425\u7ecf\u7406\uff08\u7f8e\u5986\uff09", "\u9ad8\u7ea7\u5929\u732b\u8fd0\u8425"],
+                "jobRecords": [
+                    {"text": "电商运营经理（美妆）", "jobId": "mock-commerce"},
+                    {"text": "高级天猫运营", "jobId": "mock-tmall"},
+                ],
                 "mock": True,
             }
 
@@ -1454,25 +1464,32 @@ class ChromeDebugClient:
         if not state.get("opened") and state.get("trigger"):
             trigger = state["trigger"]
             self._dispatch_mouse_click(websocket_url, trigger["x"], trigger["y"])
-            time.sleep(0.4)
-            state = self._recommend_job_filter_state(websocket_url)
+            for _ in range(15):
+                time.sleep(0.2)
+                state = self._recommend_job_filter_state(websocket_url)
+                if state.get("opened") and state.get("options"):
+                    break
 
         return {
             "selected": state.get("selected", ""),
             "opened": state.get("opened", False),
-            "options": [option.get("text", "") for option in state.get("options", []) if option.get("text")],
+            "options": list(dict.fromkeys(option["text"] for option in state.get("options", []) if option.get("text"))),
+            "jobRecords": [{"text": option["text"], "jobId": option.get("jobId")}
+                           for option in state.get("options", []) if option.get("text")],
         }
 
     def switch_recommend_job_filter(
         self,
         job_text: str,
         url_contains: str | None = "/web/chat/recommend",
+        *, exact: bool = False, expected_job_id: str | None = None,
     ) -> dict[str, Any]:
         if self.mock_dir is not None:
             return {
                 "switched": True,
                 "jobText": job_text,
                 "selected": job_text,
+                "jobId": expected_job_id,
                 "options": [job_text, "缁惧じ绗傞崚鍡涙敘閿涘牏绶ㄦ俊鍡礆"],
                 "mock": True,
             }
@@ -1485,12 +1502,15 @@ class ChromeDebugClient:
 
         target = " ".join(job_text.split())
         state = self._recommend_job_filter_state(websocket_url)
-        if state.get("selected") == target:
+        if exact and expected_job_id is None and target in state.get("duplicateLabels", []):
+            return {"switched": False, "reason": "job_label_ambiguous"}
+        if state.get("selected") == target and (expected_job_id is None or state.get("jobId") == expected_job_id):
             return {
                 "switched": True,
                 "jobText": job_text,
                 "selected": state.get("selected", ""),
                 "alreadySelected": True,
+                "jobId": state.get("jobId"),
                 "options": [option.get("text", "") for option in state.get("options", []) if option.get("text")],
             }
 
@@ -1508,14 +1528,13 @@ class ChromeDebugClient:
             time.sleep(0.5)
             state = self._recommend_job_filter_state(websocket_url)
 
+        if exact and expected_job_id is None and target in state.get("duplicateLabels", []):
+            return {"switched": False, "reason": "job_label_ambiguous"}
         options = state.get("options", [])
-        option = next(
-            (
-                item for item in options
-                if item.get("text") == target or target in str(item.get("text") or "")
-            ),
-            None,
-        )
+        matches = [item for item in options
+                   if (item.get("text") == target or (not exact and target in str(item.get("text") or "")))
+                   and (expected_job_id is None or item.get("jobId") == expected_job_id)]
+        option = matches[0] if matches and (expected_job_id is None or len(matches) == 1) else None
         if not option:
             return {
                 "switched": False,
@@ -1530,9 +1549,11 @@ class ChromeDebugClient:
         time.sleep(1.0)
         verified = self._recommend_job_filter_state(websocket_url)
         return {
-            "switched": verified.get("selected") == target or target in str(verified.get("selected") or ""),
+            "switched": (verified.get("selected") == target or (not exact and target in str(verified.get("selected") or "")))
+            and (expected_job_id is None or verified.get("jobId") == expected_job_id),
             "jobText": job_text,
             "selected": verified.get("selected", ""),
+            "jobId": verified.get("jobId"),
             "opened": verified.get("opened", False),
             "options": [item.get("text", "") for item in verified.get("options", []) if item.get("text")]
             or [item.get("text", "") for item in options if item.get("text")],
@@ -1959,6 +1980,48 @@ class ChromeDebugClient:
             return None
         return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[0]
 
+    def pin_recommend_page(self, url_contains: str) -> None:
+        if self.mock_dir is not None:
+            self._mock_recommend_viewport = 0
+            return
+        from urllib.parse import urlsplit
+
+        matches = [
+            page for page in self.list_pages()
+            if page.get("type") == "page"
+            and urlsplit(page.get("url", "")).scheme == "https"
+            and urlsplit(page.get("url", "")).hostname == "www.zhipin.com"
+            and urlsplit(page.get("url", "")).path.rstrip("/") in {"/web/chat/recommend", "/web/boss/recommend"}
+            and url_contains in page.get("url", "")
+        ]
+        if len(matches) != 1 or not matches[0].get("id") or not matches[0].get("webSocketDebuggerUrl"):
+            raise ValueError("unique_recommendation_tab_required")
+        self._recommend_page_id = matches[0]["id"]
+
+    def activate_recommend_page(self, url_contains: str) -> None:
+        if self.mock_dir is not None:
+            return
+        self.release_recommend_page()
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        ws = create_connection(page["webSocketDebuggerUrl"], timeout=10)
+        try:
+            response = self._send_cdp_command(ws, "Page.bringToFront", {})
+            if response.get("error"):
+                raise RuntimeError("recommendation_tab_activation_failed")
+            response = self._send_cdp_command(ws, "Emulation.setFocusEmulationEnabled", {"enabled": True})
+            if response.get("error"):
+                raise RuntimeError("recommendation_focus_emulation_failed")
+        except BaseException:
+            ws.close()
+            raise
+        self._recommend_focus_socket = ws
+
+    def release_recommend_page(self) -> None:
+        ws = self._recommend_focus_socket
+        self._recommend_focus_socket = None
+        if ws is not None:
+            ws.close()
+
     def open_recommend_page(self, url_contains: str | None = "/web/chat/recommend") -> dict[str, Any]:
         if self.mock_dir is not None:
             return {
@@ -1986,6 +2049,21 @@ class ChromeDebugClient:
 """.strip()
         return self._evaluate_json(websocket_url, expression)
 
+    def has_recommend_filter_tags(self, url_contains: str) -> bool:
+        if self.mock_dir is not None:
+            return False
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        result = self._evaluate_json(page["webSocketDebuggerUrl"], """
+(() => {
+  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const doc = frame?.contentDocument || document;
+  const active = [...doc.querySelectorAll('.filter-selected, .selected-filter, .condition-selected')]
+    .some(el => el.getClientRects().length && el.innerText.trim());
+  return JSON.stringify({active: Boolean(active)});
+})()
+""".strip())
+        return result.get("active") is not False
+
     def apply_recommend_filters(
         self,
         job_title: str,
@@ -1995,6 +2073,7 @@ class ChromeDebugClient:
         operation_delay_seconds: float = 0,
         max_filter_retries: int = 2,
         _attempt: int = 1,
+        confirmed_page_filters: bool = False,
     ) -> dict[str, Any]:
         if self.mock_dir is not None:
             tasks = [
@@ -2049,10 +2128,11 @@ class ChromeDebugClient:
             escaped_auto_confirm="false" if age_filter_items else "true",
             operation_delay_seconds=operation_delay_seconds,
         )
-        filter_action_count = max(1, len(remaining_filters) + len(age_filter_items))
+        option_count = sum(len(self._split_filter_values(value)) for value in remaining_filters.values())
+        filter_action_count = max(1, option_count + len(age_filter_items))
         expression_timeout = max(
             20,
-            int(20 + (operation_delay_seconds * max(3, filter_action_count * 4))),
+            int(20 + ((operation_delay_seconds or 1) * max(3, filter_action_count * 4))),
         )
         payload = self._evaluate_json(websocket_url, expression, timeout=expression_timeout)
         age_applied_filters: list[str] = []
@@ -2090,12 +2170,18 @@ class ChromeDebugClient:
                     "verified": bool(result.get("verified")),
                 }
             )
-        if (payload.get("needsConfirm") or age_clicked_filters) and not payload.get("confirmed"):
-            confirm_result = self._confirm_recommend_filter_panel(websocket_url)
+        stage_verified = all(payload.get("verification", {}).get(key, {}).get("verified") for key in remaining_filters)
+        age_ready = bool(age_filter_items) and stage_verified and len(age_applied_filters) == len(age_filter_items)
+        require_closed = confirmed_page_filters and bool(age_filter_items)
+        should_confirm = age_ready if require_closed else (payload.get("needsConfirm") or age_clicked_filters)
+        if should_confirm and not payload.get("confirmed"):
+            confirm_result = (self._confirm_recommend_filter_panel(websocket_url, exact_only=True) if require_closed
+                              else self._confirm_recommend_filter_panel(websocket_url))
             if operation_delay_seconds > 0:
                 time.sleep(operation_delay_seconds)
             payload["confirmResult"] = confirm_result
-            payload["confirmed"] = bool(confirm_result.get("clicked"))
+            payload["confirmed"] = bool(confirm_result.get("clicked") and
+                                        (not require_closed or confirm_result.get("panelClosed")))
         payload["filters"] = raw_filters
         payload.setdefault("specialFilters", {}).update(age_special_filters)
         payload["appliedFilters"] = payload.get("appliedFilters", []) + age_applied_filters
@@ -2107,10 +2193,13 @@ class ChromeDebugClient:
             result = age_special_filters.get(key, {})
             verification[key] = {
                 "applied": bool(result.get("applied")),
-                "verified": bool(result.get("verified")),
+                "verified": bool(result.get("verified")) and (not require_closed or bool(payload.get("confirmed"))),
                 "expected": value,
                 "actual": result.get("actual", []),
             }
+        if require_closed and not payload.get("confirmed"):
+            for key in remaining_filters:
+                verification.setdefault(key, {})["verified"] = False
         payload["unverifiedFilters"] = [
             str(key) for key, item in verification.items()
             if not item.get("verified")
@@ -2150,6 +2239,7 @@ class ChromeDebugClient:
                 operation_delay_seconds=operation_delay_seconds,
                 max_filter_retries=max_filter_retries,
                 _attempt=_attempt + 1,
+                confirmed_page_filters=confirmed_page_filters,
             )
             return self._merge_recommend_filter_retry_payloads(
                 base=payload,
@@ -3034,7 +3124,7 @@ class ChromeDebugClient:
 """.strip()
         return self._evaluate_json(websocket_url, expression)
 
-    def _confirm_recommend_filter_panel(self, websocket_url: str) -> dict[str, Any]:
+    def _confirm_recommend_filter_panel(self, websocket_url: str, *, exact_only: bool = False) -> dict[str, Any]:
         expression = r"""
 (async () => {
   const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
@@ -3089,11 +3179,15 @@ class ChromeDebugClient:
     .filter((item) => item.area > 100 && item.area < 20000)
     .sort((a, b) => (b.top - a.top) || (b.left - a.left) || (a.area - b.area))[0]?.el || null;
   if (exactButton) {
-    clickElement(exactButton);
+    if (__EXACT_ONLY__) exactButton.click();
+    else clickElement(exactButton);
     await delay(900);
     if (!doc.querySelector('.filter-panel')) {
       return JSON.stringify({ clicked: true, method: 'dom_exact_button', panelClosed: true });
     }
+  }
+  if (__EXACT_ONLY__) {
+    return JSON.stringify({ clicked: Boolean(exactButton), panelClosed: !visible(panel) });
   }
   const rootVm = findFilterRootVue(panel);
   if (rootVm?.confirm) {
@@ -3123,7 +3217,7 @@ class ChromeDebugClient:
     reason: exactButton ? '' : 'confirm_button_not_found'
   });
 })()
-""".strip()
+""".strip().replace("__EXACT_ONLY__", "true" if exact_only else "false")
         return self._evaluate_json(websocket_url, expression, timeout=10)
 
     def _recommend_age_slider_state(self, websocket_url: str) -> dict[str, Any]:
@@ -3283,6 +3377,7 @@ class ChromeDebugClient:
 
   const text = (el) => norm(el?.innerText || el?.textContent || '');
   const triggerSelectors = [
+    '.job-selecter-wrap .ui-dropmenu-label',
     '.job-select .ui-dropmenu-label',
     '.recommend-job-select .ui-dropmenu-label',
     '.filter-job-select .ui-dropmenu-label',
@@ -3299,25 +3394,39 @@ class ChromeDebugClient:
       return (br.top < 160 ? 1 : 0) - (ar.top < 160 ? 1 : 0) || ar.top - br.top;
     });
   const trigger = triggers[0] || null;
-  const selected = text(doc.querySelector('.dropmenu-label.chat-select-job'))
+  const selectedNode = doc.querySelector('.dropmenu-label.chat-select-job') || trigger;
+  const selected = text(selectedNode)
     || text(trigger)
     || '';
 
   const optionNodes = Array.from(doc.querySelectorAll(
     '.ui-dropmenu-visible .ui-dropmenu-list li, .ui-dropmenu-visible li, .job-select li, .recommend-job-select li, [class*="dropmenu"] li'
   ));
+  const jobMenu = trigger?.closest('.job-selecter-wrap');
+  const jobIdentity = (el) => el?.getAttribute('data-job-id')
+    || (el?.matches('li.job-item') && jobMenu?.contains(el) ? el.getAttribute('value') : null);
+  // The selected item stays marked even when the menu is collapsed.
+  const activeItems = Array.from(jobMenu?.querySelectorAll('li.job-item.curr') || []);
+  const activeItem = activeItems.length === 1 && text(activeItems[0]) === selected ? activeItems[0] : null;
   const seen = new Set();
+  const duplicateLabels = new Set();
   const options = [];
   for (const el of optionNodes) {
+    if (jobMenu && (!jobMenu.classList.contains('ui-dropmenu-visible') || !jobMenu.contains(el))) continue;
     if (!isVisible(el)) continue;
     const value = text(el);
-    if (!value || seen.has(value)) continue;
+    if (!value) continue;
+    if (seen.has(value)) {
+      duplicateLabels.add(value);
+    }
     seen.add(value);
-    options.push({ text: value, ...center(el) });
+    options.push({ text: value, jobId: jobIdentity(el), ...center(el) });
   }
 
   return JSON.stringify({
     selected,
+    jobId: selectedNode?.closest('[data-job-id]')?.getAttribute('data-job-id') || jobIdentity(activeItem) || null,
+    duplicateLabels: [...duplicateLabels],
     opened: options.length > 0,
     trigger: trigger && isVisible(trigger) ? center(trigger) : null,
     options,
@@ -3543,7 +3652,11 @@ class ChromeDebugClient:
         url_contains: str | None = "/web/chat/recommend",
     ) -> dict[str, Any]:
         if self.mock_dir is not None:
-            payload = json.loads((self.mock_dir / "recommend_candidates.json").read_text(encoding="utf-8"))
+            fixture = self.mock_dir / "recommend_viewports.json"
+            if fixture.is_file():
+                payload = json.loads(fixture.read_text(encoding="utf-8"))[self._mock_recommend_viewport]
+            else:
+                payload = json.loads((self.mock_dir / "recommend_candidates.json").read_text(encoding="utf-8"))
             payload["candidates"] = payload.get("candidates", [])[:max_count]
             payload["count"] = len(payload["candidates"])
             return payload
@@ -3554,8 +3667,44 @@ class ChromeDebugClient:
         if not websocket_url:
             raise ValueError("Selected page does not have webSocketDebuggerUrl")
 
-        expression = build_capture_recommend_candidates_expression_v2(max_count=max_count)
+        expression = build_capture_recommend_candidates_expression_v2(max_count=max_count, minimize=self._recommend_page_id is not None)
         return self._evaluate_json(websocket_url, expression)
+
+    def has_recommend_challenge(self, url_contains: str) -> bool:
+        if self.mock_dir is not None:
+            return False
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        result = self._evaluate_json(page["webSocketDebuggerUrl"], """
+(() => {
+  const iframe = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const doc = iframe?.contentDocument || document;
+  const text = (doc.body?.innerText || '').slice(0, 350);
+  return JSON.stringify({blocked: /安全验证|访问异常|访问过于频繁|请完成验证码/.test(text)});
+})()
+""".strip())
+        return result.get("blocked") is not False
+
+    def advance_recommend_viewport(self, url_contains: str, *, to_top: bool = False) -> dict[str, Any]:
+        if self.mock_dir is not None:
+            if to_top:
+                self._mock_recommend_viewport = 0
+                return {"advanced": True}
+            fixture = self.mock_dir / "recommend_viewports.json"
+            if not fixture.is_file() or self._mock_recommend_viewport + 1 >= len(
+                json.loads(fixture.read_text(encoding="utf-8"))
+            ):
+                return {"advanced": False, "reason": "end_of_list"}
+            self._mock_recommend_viewport += 1
+            return {"advanced": True}
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        return self._evaluate_json(page["webSocketDebuggerUrl"], build_advance_recommend_viewport_expression(to_top=to_top))
+
+    def verify_recommend_job_context(self, expected: str, job_id: str | None, url_contains: str) -> bool:
+        if self.mock_dir is not None:
+            return True
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        state = self._recommend_job_filter_state(page["webSocketDebuggerUrl"])
+        return state.get("selected") == " ".join(expected.split()) and (job_id is None or state.get("jobId") == job_id)
 
     def wait_for_recommend_results_stable(
         self,
@@ -3643,7 +3792,10 @@ class ChromeDebugClient:
         candidate_id: str | None = None,
         card_index: int | None = None,
         url_contains: str | None = "/web/chat/recommend",
+        *, strict_identity: bool = False,
     ) -> dict[str, Any]:
+        if strict_identity and not candidate_id:
+            return {"opened": False, "reason": "candidate_id_required"}
         if self.mock_dir is not None:
             self._mock_current_candidate_id = candidate_id or f"candidate-{card_index or 0}"
             return {
@@ -3660,6 +3812,8 @@ class ChromeDebugClient:
 
         escaped_candidate_id = json.dumps(candidate_id or "", ensure_ascii=False)
         index = 0 if card_index is None else card_index
+        binding_token = uuid4().hex if strict_identity else ""
+        self._recommend_binding_token = None
         expression = f"""
 (async () => {{
   const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
@@ -3707,18 +3861,51 @@ class ChromeDebugClient:
   const cards = (primaryCards.length ? primaryCards : Array.from(doc.querySelectorAll('[data-geekid], [data-geek-id], .geek-card, .recommend-card, .candidate-card')))
     .filter((el) => isVisible(el) && isMainCandidateCard(el))
     .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-  const target = cards.find((el) => {{
-    const id = el.getAttribute('data-geekid') || el.getAttribute('data-geek-id') || el.getAttribute('data-id') || '';
+  const strict = {json.dumps(strict_identity)};
+  {_recommend_card_identity_javascript()}
+  {_recommend_detail_binding_javascript()}
+  if (strict && detailRoots().length) {{
+    return JSON.stringify({{opened:false, reason:'prior_detail_not_closed'}});
+  }}
+  const matches = cards.filter((el) => {{
+    const id = cardIdentity(el) || (!strict && el.getAttribute('data-id')) || '';
     return {escaped_candidate_id} && id === {escaped_candidate_id};
-  }}) || cards[{index}];
+  }});
+  const target = strict ? (matches.length === 1 ? matches[0] : null) : (matches[0] || cards[{index}]);
   if (!target) {{
     return JSON.stringify({{ opened: false, reason: 'not_found', cardIndex: {index} }});
   }}
   target.scrollIntoView({{ block: 'center', inline: 'center' }});
   await sleep(250);
+  const actualId = cardIdentity(target) || (!strict && target.getAttribute('data-id')) || '';
+  if (strict && (!target.isConnected || actualId !== {escaped_candidate_id})) {{
+    return JSON.stringify({{opened: false, reason: 'candidate_card_changed'}});
+  }}
   const clickable = target.querySelector('.card-inner, .geek-info, .info-primary, .name, [class*="content"]') || target;
   clickable.click();
   await sleep(900);
+  let boundToken = '';
+  if (strict) {{
+    const root = uniqueDetailRoot();
+    if (root) {{
+      const key = Symbol.for('boss-agent.recommend-detail');
+      doc[key]?.dispose?.();
+      const binding = {{candidateId:actualId, card:target, root,
+        token:{json.dumps(binding_token)}, invalidated:false}};
+      const invalidate = event => {{
+        const el = event.target?.closest?.('li.card-item, .candidate-card-wrap, .close-btn, .boss-popup__close');
+        if (el) binding.invalidated = true;
+      }};
+      const observer = new MutationObserver(() => {{
+        if (!root.isConnected || uniqueDetailRoot() !== root) binding.invalidated = true;
+      }});
+      observer.observe(doc.body, {{childList:true, subtree:true}});
+      doc.addEventListener('click', invalidate, true);
+      binding.dispose = () => {{observer.disconnect(); doc.removeEventListener('click', invalidate, true);}};
+      doc[key] = binding;
+      boundToken = binding.token;
+    }}
+  }}
   const frameRect = frame ? frame.getBoundingClientRect() : {{ left: 0, top: 0 }};
   const rect = target.getBoundingClientRect();
   const point = {{
@@ -3732,7 +3919,8 @@ class ChromeDebugClient:
   return JSON.stringify({{
     opened: true,
     domClicked: true,
-    candidateId: target.getAttribute('data-geekid') || target.getAttribute('data-geek-id') || target.getAttribute('data-id') || '',
+    candidateId: actualId,
+    bindingToken: boundToken,
     cardIndex: cards.indexOf(target),
     point
   }});
@@ -3745,7 +3933,11 @@ class ChromeDebugClient:
             payload["detailState"] = detail
             payload["opened"] = bool(detail.get("detailOpen"))
             if payload["opened"]:
+                if strict_identity and payload.get("bindingToken") == binding_token:
+                    self._recommend_binding_token = binding_token
                 return payload
+        if strict_identity:
+            return payload
         point = payload.get("point")
         if point:
             self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
@@ -3759,7 +3951,10 @@ class ChromeDebugClient:
     def capture_candidate_resume(
         self,
         url_contains: str | None = "/web/chat/recommend",
+        *, expected_candidate_id: str | None = None,
     ) -> dict[str, Any]:
+        if expected_candidate_id is not None:
+            return self._capture_verified_recommend_resume(expected_candidate_id, url_contains)
         if self.mock_dir is not None:
             if self._mock_current_candidate_id:
                 candidates = json.loads((self.mock_dir / "recommend_candidates.json").read_text(encoding="utf-8"))
@@ -3818,6 +4013,52 @@ class ChromeDebugClient:
                 latest["captureStatus"] = "canvas_not_ready"
                 latest.setdefault("ocrStatus", "skipped_canvas_not_ready")
         return latest
+
+    def _capture_verified_recommend_resume(self, candidate_id: str, url_contains: str | None) -> dict[str, Any]:
+        if self.mock_dir is not None:
+            if self._mock_current_candidate_id != candidate_id:
+                return {"captureStatus": "detail_identity_mismatch"}
+            records = json.loads((self.mock_dir / "candidate_resumes.json").read_text(encoding="utf-8"))
+            return records.get(candidate_id, {"captureStatus": "detail_missing"})
+
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        websocket_url = page["webSocketDebuggerUrl"]
+        expression = build_verified_recommend_detail_expression(self._recommend_binding_token)
+        deadline = time.monotonic() + 16
+        latest: dict[str, Any] = {}
+        previous_signature = None
+        while time.monotonic() < deadline:
+            latest = self._evaluate_json(websocket_url, expression)
+            signature = (latest.get("fullDomText"), latest.get("resumeFrameSrc"))
+            verified = latest.get("detailCandidateId") == candidate_id and latest.get("captureStatus") == "ready"
+            if verified and signature == previous_signature:
+                if not latest.get("canvasExpected"):
+                    return latest
+                canvas = self._wait_recommend_resume_canvas_ready(websocket_url, timeout_seconds=12)
+                if canvas.get("ready"):
+                    latest = self._augment_resume_with_canvas_ocr(websocket_url, latest)
+                    ocr = latest.get("ocr") or {}
+                    scroll = ocr.get("scrollContainer") or {}
+                    positions = scroll.get("positions") or []
+                    if scroll and positions:
+                        expected_end = max(0, scroll.get("scrollHeight", 0) - scroll.get("clientHeight", 0))
+                        latest["ocrTruncated"] = positions[-1] < expected_end - 2
+                    elif ocr.get("scrolledFallbackReason"):
+                        latest["ocrTruncated"] = True
+                else:
+                    latest["ocrStatus"] = "canvas_not_ready"
+                # Never attribute OCR to a detail that changed during capture.
+                after = self._evaluate_json(websocket_url, expression)
+                if (after.get("detailCandidateId") == candidate_id and after.get("captureStatus") == "ready"
+                        and (after.get("fullDomText"), after.get("resumeFrameSrc")) == signature):
+                    return {**latest, "fullDomText": after.get("fullDomText", "")}
+                return {"captureStatus": "detail_changed_during_ocr"}
+            previous_signature = signature if verified else None
+            time.sleep(0.4)
+        return {
+            **latest, "captureReason": latest.get("captureStatus"),
+            "captureStatus": "detail_not_ready_or_identity_unverified",
+        }
 
     @staticmethod
     def _resume_detail_preview_ready(preview: str) -> bool:
@@ -3907,8 +4148,8 @@ class ChromeDebugClient:
         try:
             scrolled = self._evaluate_json(
                 websocket_url,
-                build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments=6),
-                timeout=15,
+                build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments=24),
+                timeout=48,
             )
         except Exception as exc:
             scrolled = {"found": False, "error": str(exc), "reason": "scrolled_capture_failed"}
@@ -4140,137 +4381,48 @@ class ChromeDebugClient:
                 "mock": True,
             }
 
-        pages = self.list_pages()
-        page = self._select_page(pages, url_contains=url_contains)
-        websocket_url = page.get("webSocketDebuggerUrl")
-        if not websocket_url:
-            raise ValueError("Selected page does not have webSocketDebuggerUrl")
-
-        # Dismiss any popup cards before attempting greet
-        pre_dismiss = self.dismiss_recommend_popup_cards(url_contains=url_contains)
-        time.sleep(0.3)
-
-        payload = self._evaluate_json(websocket_url, build_click_recommend_detail_greet_expression_v2(), timeout=10)
-        point = payload.get("button")
-        if payload.get("clicked") and (not point or "x" not in point or "y" not in point):
-            time.sleep(1.5)
-            # Dismiss popups that may have appeared after the click
-            post_dismiss = self.dismiss_recommend_popup_cards(url_contains=url_contains)
-            verified = self._evaluate_json(websocket_url, build_recommend_detail_greet_state_expression_v2(), timeout=10)
-            return {
-                "greeted": bool(verified.get("greeted")),
-                "clicked": True,
-                "status": verified.get("status", ""),
-                "before": payload,
-                "after": verified,
-                "preDismiss": pre_dismiss,
-                "postDismiss": post_dismiss,
-            }
-        if not point:
-            return {**payload, "preDismiss": pre_dismiss}
-        self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
-        time.sleep(1.5)
-        # Dismiss popups that may have appeared after click
-        post_dismiss = self.dismiss_recommend_popup_cards(url_contains=url_contains)
-        time.sleep(0.3)
-        verified = self._evaluate_json(websocket_url, build_recommend_detail_greet_state_expression_v2(), timeout=10)
-        return {
-            "greeted": bool(verified.get("greeted")),
-            "clicked": True,
-            "status": verified.get("status", ""),
-            "before": payload,
-            "after": verified,
-            "preDismiss": pre_dismiss,
-            "postDismiss": post_dismiss,
-        }
+        return blocked_contact()
 
     def click_recommend_card_greet(
         self,
         candidate_id: str | None = None,
         card_index: int | None = None,
         url_contains: str | None = "/web/chat/recommend",
+        *, allow_live: bool = False,
     ) -> dict[str, Any]:
+        if not candidate_id or not candidate_id.strip():
+            return {"greeted": False, "clicked": False, "reason": "candidate_id_required"}
         if self.mock_dir is not None:
-            return {"greeted": True, "clicked": True, "mock": True}
-
-        pages = self.list_pages()
-        page = self._select_page(pages, url_contains=url_contains)
-        websocket_url = page.get("webSocketDebuggerUrl")
-        if not websocket_url:
-            raise ValueError("Selected page does not have webSocketDebuggerUrl")
-
-        # Dismiss popup cards before attempting greet
-        pre_dismiss = self.dismiss_recommend_popup_cards(url_contains=url_contains)
-        time.sleep(0.3)
-
-        payload = self._evaluate_json(
-            websocket_url,
-            build_click_recommend_card_greet_expression(
-                escaped_candidate_id=json.dumps(candidate_id or "", ensure_ascii=False),
-                card_index=0 if card_index is None else card_index,
-            ),
-            timeout=10,
+            return {"greeted": True, "clicked": True, "candidateId": candidate_id, "mock": True,
+                    "status": "已打招呼"}
+        if allow_live is not True:
+            return blocked_contact()
+        if self.has_recommend_challenge(url_contains):
+            return {"clicked": False, "greeted": False, "reason": "page_challenge_detected"}
+        page = self._select_page(self.list_pages(), url_contains=url_contains)
+        websocket_url = page["webSocketDebuggerUrl"]
+        encoded_id = json.dumps(candidate_id, ensure_ascii=False)
+        result = self._evaluate_json(
+            websocket_url, build_click_recommend_card_greet_expression(encoded_id), timeout=10,
         )
-        point = payload.get("button") or {}
-        if payload.get("clicked") and point.get("x") is not None and point.get("y") is not None:
-            self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
-            time.sleep(1.5)
-            # Dismiss popups that may appear after clicking greet
-            post_dismiss = self.dismiss_recommend_popup_cards(url_contains=url_contains)
-            time.sleep(0.3)
+        if not result.get("clicked"):
+            return result
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
             verified = self._evaluate_json(
-                websocket_url,
-                build_capture_recommend_candidates_expression_v2(max_count=max((card_index or 0) + 1, 1)),
-                timeout=10,
+                websocket_url, build_click_recommend_card_greet_expression(encoded_id, verify_only=True), timeout=10,
             )
-            status = ""
-            for item in verified.get("candidates", []):
-                if int(item.get("cardIndex") or 0) == int(card_index or 0):
-                    status = str(item.get("greetStatus") or "")
-                    break
-            # Also verify by checking if card greet button text changed
-            btn_verified = self._evaluate_json(
-                websocket_url,
-                build_recommend_detail_greet_state_expression_v2(),
-                timeout=10,
-            )
-            return {
-                **payload,
-                "afterStatus": status,
-                "greeted": (
-                    self._is_recommend_greeted_status(status)
-                    or bool(btn_verified.get("greeted"))
-                ),
-                "preDismiss": pre_dismiss,
-                "postDismiss": post_dismiss,
-                "buttonVerify": btn_verified,
-            }
-        return {**payload, "preDismiss": pre_dismiss}
+            if verified.get("candidateId") == candidate_id and self._is_recommend_greeted_status(verified.get("status")):
+                return {**result, "greeted": True, "status": verified["status"]}
+            time.sleep(0.4)
+        return {**result, "greeted": False, "reason": "send_unconfirmed"}
 
     @staticmethod
     def _is_recommend_greeted_status(status: str) -> bool:
-        value = str(status or "").strip()
-        if not value:
-            return False
-        # Labels that indicate greeting was NOT sent yet
-        pending_labels = [
-            "\u6253\u62db\u547c",      # 打招呼
-            "\u7acb\u5373\u6c9f\u901a",  # 立即沟通
-            "\u8054\u7cfb",            # 联系
-        ]
-        # Labels that indicate greeting WAS sent
-        greeted_labels = [
-            "\u5df2\u6253\u62db\u547c",  # 已打招呼
-            "\u7ee7\u7eed\u6c9f\u901a",  # 继续沟通
-            "\u5df2\u6c9f\u901a",       # 已沟通
-            "\u6c9f\u901a\u4e2d",       # 沟通中
-            "\u5df2\u8054\u7cfb",       # 已联系
-        ]
-        if any(label in value for label in greeted_labels):
-            return True
-        return not any(label and label in value for label in pending_labels)
+        return str(status or "").strip() in CONFIRMED_CONTACT_STATES
 
     def close_recommend_detail(self, url_contains: str | None = "/web/chat/recommend") -> dict[str, Any]:
+        self._recommend_binding_token = None
         if self.mock_dir is not None:
             return {
                 "closed": True,
@@ -4305,14 +4457,22 @@ class ChromeDebugClient:
                 after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
                 if not after.get("detailOpen"):
                     return {**payload, "verifiedClosed": True, "before": before, "after": after}
-            self._dispatch_escape_key(websocket_url)
+            located = self._evaluate_json(
+                websocket_url, build_close_recommend_detail_expression_v2(locate_only=True), timeout=10,
+            )
+            point = located.get("button") or {}
+            if point.get("x") is not None and point.get("y") is not None:
+                self._dispatch_mouse_click(websocket_url, point["x"], point["y"])
+            else:
+                self._dispatch_escape_key(websocket_url)
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 time.sleep(0.3)
                 after = self._evaluate_json(websocket_url, build_recommend_detail_open_state_expression_v2(), timeout=10)
                 if not after.get("detailOpen"):
-                    return {**payload, "verifiedClosed": True, "escapeFallback": True, "before": before, "after": after}
-            return {**payload, "verifiedClosed": False, "before": before, "after": after}
+                    return {**payload, "verifiedClosed": True, "coordinateFallback": bool(point),
+                            "escapeFallback": not bool(point), "before": before, "after": after}
+            return {**payload, "closed": False, "verifiedClosed": False, "before": before, "after": after}
         point = payload.get("button")
         if not point:
             return {**payload, "before": before}
@@ -4332,55 +4492,9 @@ class ChromeDebugClient:
                 "mock": True,
             }
 
-        pages = self.list_pages()
-        page = self._select_page(pages, url_contains=url_contains)
-        websocket_url = page.get("webSocketDebuggerUrl")
-        if not websocket_url:
-            raise ValueError("Selected page does not have webSocketDebuggerUrl")
-
-        escaped_message = json.dumps(message, ensure_ascii=False)
-        escaped_send = "true" if send else "false"
-        expression = f"""
-(() => {{
-  const text = (el) => el ? (el.innerText || '').trim() : '';
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-  }};
-  const contactButton = Array.from(document.querySelectorAll('button, a, .btn'))
-    .find((el) => isVisible(el) && /鎵撴嫑鍛紎绔嬪嵆娌熼€殀娌熼€殀鑱旂郴/.test(text(el)));
-  if (!contactButton) {{
-    return JSON.stringify({{ prepared: false, sent: false, reason: 'contact_button_not_found', body: {escaped_message} }});
-  }}
-  contactButton.click();
-  const input = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], .chat-input, .boss-chat-editor-input'))
-    .find((el) => isVisible(el));
-  if (!input) {{
-    return JSON.stringify({{ prepared: false, sent: false, reason: 'input_not_found', body: {escaped_message} }});
-  }}
-  input.focus();
-  if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {{
-    input.value = {escaped_message};
-  }} else {{
-    input.innerHTML = '';
-    input.textContent = {escaped_message};
-  }}
-  input.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: {escaped_message} }}));
-  if (!{escaped_send}) {{
-    return JSON.stringify({{ prepared: true, sent: false, body: {escaped_message} }});
-  }}
-  const sendButton = Array.from(document.querySelectorAll('button, a, .btn'))
-    .find((el) => isVisible(el) && /鍙戦€亅纭畾|鎵撴嫑鍛紎绔嬪嵆娌熼€?.test(text(el)));
-  if (!sendButton) {{
-    return JSON.stringify({{ prepared: true, sent: false, reason: 'send_button_not_found', body: {escaped_message} }});
-  }}
-  sendButton.click();
-  return JSON.stringify({{ prepared: true, sent: true, body: {escaped_message} }});
-}})()
-""".strip()
-        return self._evaluate_json(websocket_url, expression)
+        if send:
+            return {**blocked_contact(), "prepared": False, "body": message}
+        return {"prepared": bool(message.strip()), "sent": False, "body": message, "dryRun": True}
 
     def greet_recommend_candidates_by_name(
         self,
@@ -4396,39 +4510,7 @@ class ChromeDebugClient:
                 "mock": True,
             }
 
-        pages = self.list_pages()
-        page = self._select_page(pages, url_contains=url_contains)
-        websocket_url = page.get("webSocketDebuggerUrl")
-        if not websocket_url:
-            raise ValueError("Selected page does not have webSocketDebuggerUrl")
-
-        results: list[dict[str, Any]] = []
-        for name in names:
-            point = self._recommend_greet_button_point(websocket_url, name)
-            if not point.get("found"):
-                results.append({"name": name, "greeted": False, "reason": point.get("reason", "not_found")})
-                continue
-            if point.get("status") and self._is_recommend_greeted_status(point.get("status", "")):
-                results.append({"name": name, "greeted": True, "status": point.get("status"), "alreadyGreeted": True})
-                continue
-            if not point.get("button"):
-                results.append({"name": name, "greeted": False, "reason": "button_not_found", "status": point.get("status", "")})
-                continue
-            button = point["button"]
-            self._dispatch_mouse_click(websocket_url, button["x"], button["y"])
-            time.sleep(1.0)
-            verified = self._recommend_greet_button_point(websocket_url, name)
-            status = verified.get("status", "")
-            results.append(
-                {
-                    "name": name,
-                    "greeted": self._is_recommend_greeted_status(status),
-                    "status": status,
-                    "clicked": True,
-                    "button": button,
-                }
-            )
-        return {"results": results}
+        return {"results": [], **blocked_contact()}
 
     def _get_json(self, path: str, fixture_name: str) -> Any:
         if self.mock_dir is not None:
@@ -4442,6 +4524,15 @@ class ChromeDebugClient:
         pages: list[dict[str, Any]],
         url_contains: str | None = None,
     ) -> dict[str, Any]:
+        if self._recommend_page_id is not None:
+            from urllib.parse import urlsplit
+
+            for page in pages:
+                url = urlsplit(page.get("url", ""))
+                if (page.get("id") == self._recommend_page_id and url.scheme == "https" and url.hostname == "www.zhipin.com"
+                        and url.path.rstrip("/") in {"/web/chat/recommend", "/web/boss/recommend"}):
+                    return page
+            raise ValueError("pinned_recommendation_tab_unavailable")
         if url_contains:
             for page in pages:
                 if url_contains in page.get("url", ""):
@@ -5088,12 +5179,20 @@ def build_apply_recommend_filters_expression(
     escaped_auto_confirm: str = "true",
     operation_delay_seconds: float = 0,
 ) -> str:
+    from boss_agent.boss_major_filters import BOSS_MAJOR_CATEGORY
+    from boss_agent.task_schema import BOSS_PAGE_FILTERS
+
+    strict_filter_names = json.dumps(list(BOSS_PAGE_FILTERS), ensure_ascii=False)
+    major_categories = json.dumps(BOSS_MAJOR_CATEGORY, ensure_ascii=False)
     action_delay_ms = max(0, int(float(operation_delay_seconds or 0) * 1000))
     return f"""
 (async () => {{
   const jobTitle = {escaped_job_title};
   const city = {escaped_city};
   const filters = {escaped_filters};
+  const strictKeys = new Set({strict_filter_names});
+  const majorCategories = {major_categories};
+  const strictRun = Object.keys(filters || {{}}).some(key => strictKeys.has(key));
   const autoConfirm = {escaped_auto_confirm};
   const actionDelayMs = {action_delay_ms};
   const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
@@ -5268,7 +5367,13 @@ def build_apply_recommend_filters_expression(
     }});
     return groups[0]?.el || null;
   }};
-  const findOption = (scope, value) => {{
+  const strictGroup = (key) => visibleNodes('.filter-panel .filter-item, .filter-panel .condition-item').find(el => {{
+    const label = text(el.querySelector('.name, .filter-name, .label') || el.firstElementChild);
+    return label.replace(/[\s]/g,'').replace(/[\[【（(]单选[\]】）)]$/, '') === key;
+  }}) || null;
+  const filterGroup = key => strictKeys.has(key)?strictGroup(key):(findFilterItemV2(key) || findFilterItem(key));
+  const sameOption = (first, second) => first.replace(/\s+/g,'') === second.replace(/\s+/g,'');
+  const findOption = (scope, value, exact = false) => {{
     const selectors = '.option, .default, .operate-btn, button, a, span, label, li';
     const normalizedValue = String(value || '').trim().toLowerCase();
     const candidates = Array.from((scope || rootDocument).querySelectorAll(selectors))
@@ -5276,7 +5381,8 @@ def build_apply_recommend_filters_expression(
       .filter((el) => {{
         const nodeText = text(el);
         const normalizedText = nodeText.toLowerCase();
-        return nodeText === value || nodeText.includes(value) || normalizedText === normalizedValue || normalizedText.includes(normalizedValue);
+        return exact ? sameOption(nodeText, value)
+          : nodeText === value || nodeText.includes(value) || normalizedText === normalizedValue || normalizedText.includes(normalizedValue);
       }})
       .sort((a, b) => {{
         const textDelta = Number(text(a) !== value) - Number(text(b) !== value);
@@ -5287,20 +5393,61 @@ def build_apply_recommend_filters_expression(
       }});
     return candidates[0] || null;
   }};
-  const clickOptionAndReadSelected = async (scope, value) => {{
-    const target = findOption(scope, value) || findOption(rootDocument.querySelector('.filter-panel') || rootDocument, value);
+  const prepareMajorOptions = async values => {{
+    const group = strictGroup('专业');
+    if (!group || values.every(value => findOption(group, value, true))) return;
+    const trigger = group.querySelector('.operate-btn.major');
+    if (!isVisible(trigger) || !values.every(value => Object.hasOwn(majorCategories,value))) return;
+    trigger.click();
+    await delay(300);
+    const dialog = visibleNodes('.filter-subject-dialog')[0];
+    if (!dialog) return;
+    const footerButton = label => Array.from(dialog.querySelectorAll('.major-footer-btns button'))
+      .find(button => text(button) === label && isVisible(button) && !button.disabled);
+    const selected = () => Array.from(dialog.querySelectorAll('.major-select-item'));
+    let saved = false;
+    try {{
+      for (const item of selected()) {{
+        if (!values.includes(text(item))) item.querySelector('.iboss-close')?.click();
+      }}
+      for (const value of values) {{
+        if (selected().some(item => text(item) === value)) continue;
+        const category = Array.from(dialog.querySelectorAll('.filter-major-cate > div'))
+          .find(item => text(item) === majorCategories[value]);
+        if (!isVisible(category)) return;
+        category.click();
+        await delay(100);
+        const option = Array.from(dialog.querySelectorAll('.filter-major-names > div'))
+          .find(item => text(item) === value);
+        if (!isVisible(option)) return;
+        option.click();
+      }}
+      const picked = selected().map(text);
+      const confirm = footerButton('确定');
+      if (picked.length !== values.length || !values.every(value => picked.includes(value)) || !confirm) return;
+      confirm.click();
+      await delay(350);
+      saved = !isVisible(dialog);
+    }} finally {{
+      if (!saved && isVisible(dialog)) footerButton('取消')?.click();
+    }}
+  }};
+  const clickOptionAndReadSelected = async (scope, value, strict = false) => {{
+    const target = strict ? (scope && findOption(scope, value, true))
+      : findOption(scope, value) || findOption(rootDocument.querySelector('.filter-panel') || rootDocument, value);
     if (!target) {{
       return {{ clicked: false, selected: [], reason: 'option_not_found' }};
     }}
     const clickTarget = target.closest('button, a, label, li, .option, .default, .operate-btn') || target;
     clickTarget.scrollIntoView?.({{ block: 'center', inline: 'center' }});
     await waitAfterOptionClick();
-    clickElement(clickTarget);
+    if (strict) clickTarget.click();
+    else clickElement(clickTarget);
     await waitAfterOptionClick();
     const group = scope || clickTarget.closest('.filter-item, .condition-item, .filter-wrap') || rootDocument;
     let selected = selectedTextsInGroup(group);
     let vueForced = null;
-    if (!valuesVerifiedBySelected([value], selected)) {{
+    if (!strict && !valuesVerifiedBySelected([value], selected)) {{
       vueForced = forceOptionViaVue(group, value);
       if (vueForced.applied) {{
         await waitAfterOptionClick();
@@ -5662,7 +5809,8 @@ def build_apply_recommend_filters_expression(
       .filter((item) => item.area > 100 && item.area < 20000)
       .sort((a, b) => (b.top - a.top) || (b.left - a.left) || (a.area - b.area))[0]?.el || null;
     if (exactConfirmButton) {{
-      clickElement(exactConfirmButton);
+      if (strictRun) exactConfirmButton.click();
+      else clickElement(exactConfirmButton);
       await delay(actionDelayMs || 1000);
       if (!rootDocument.querySelector('.filter-panel')) {{
         return {{ clicked: true, method: 'dom_exact_button', panelClosed: true }};
@@ -5750,23 +5898,26 @@ def build_apply_recommend_filters_expression(
       continue;
     }}
     const values = splitFilterValues(value);
-    const filterItem = findFilterItemV2(key) || findFilterItem(key);
+    if (key === '专业') await prepareMajorOptions(values);
+    const filterItem = filterGroup(key);
+    const strict = strictKeys.has(key);
+    const confirms = (item, selected) => strict?selected.some(value=>sameOption(value,item)):valuesVerifiedBySelected([item], selected);
     const similar = similarPanelItems(key, value, panelScanBefore);
     const clickedValues = [];
     const missingValues = [];
     const selectedSnapshots = [];
     for (const item of values) {{
-      const selectedBefore = selectedTextsInGroup(filterItem || rootDocument);
-      const firstClick = valuesVerifiedBySelected([item], selectedBefore)
+      const selectedBefore = selectedTextsInGroup(filterItem || (strict?null:rootDocument));
+      const firstClick = confirms(item, selectedBefore)
         ? {{ clicked: true, selected: selectedBefore, alreadySelected: true }}
-        : await clickOptionAndReadSelected(filterItem, item);
+        : await clickOptionAndReadSelected(filterItem, item, strict);
       if (firstClick.clicked) {{
         let latestClick = firstClick;
         let retried = false;
         if (firstClick.alreadySelected) {{
           await waitAfterOptionClick();
         }}
-        if (!firstClick.alreadySelected && !valuesVerifiedBySelected([item], firstClick.selected)) {{
+        if (!strict && !firstClick.alreadySelected && !valuesVerifiedBySelected([item], firstClick.selected)) {{
           retried = true;
           latestClick = await clickOptionAndReadSelected(filterItem, item);
         }}
@@ -5787,7 +5938,7 @@ def build_apply_recommend_filters_expression(
       }}
       await waitAfterOptionClick();
     }}
-    const selectedAfterClick = selectedTextsInGroup(filterItem || rootDocument);
+    const selectedAfterClick = selectedTextsInGroup(filterItem || (strict?null:rootDocument));
     specialFilters[key] = {{
       applied: clickedValues.length > 0,
       method: 'panel_options',
@@ -5823,11 +5974,15 @@ def build_apply_recommend_filters_expression(
   for (const [key] of Object.entries(filters || {{}})) {{
     const result = specialFilters[key];
     if (result?.method === 'panel_options') {{
-      const filterItem = findFilterItemV2(key) || findFilterItem(key);
-      result.selectedBeforeConfirm = selectedTextsInGroup(filterItem || rootDocument);
+      const filterItem = filterGroup(key);
+      result.selectedBeforeConfirm = selectedTextsInGroup(filterItem || (strictKeys.has(key)?null:rootDocument));
     }}
   }}
-  const confirmButton = autoConfirm && filterEntries.length > 0 && appliedFilters.length > 0
+  const strictReady = !strictRun || filterEntries.every(([key,value]) =>
+    strictKeys.has(key)?splitFilterValues(value).every(item =>
+      (specialFilters[key]?.selectedBeforeConfirm || []).some(selected=>sameOption(selected,item))):
+      valueVerified(key, value, specialFilters[key], echoBeforeConfirm));
+  const confirmButton = !strictRun && autoConfirm && filterEntries.length > 0 && appliedFilters.length > 0
     ? visibleNodes('button, a, .btn, span')
         .find((el) => /\u786e\u5b9a|\u786e\u8ba4|\u5b8c\u6210|\u7b5b\u9009/.test(text(el)))
     : null;
@@ -5835,7 +5990,8 @@ def build_apply_recommend_filters_expression(
     clickElement(confirmButton);
     await delay(actionDelayMs || 1000);
   }}
-  if (autoConfirm && rootDocument.querySelector('.filter-panel')) {{
+  let exactConfirmed = false;
+  if (autoConfirm && strictReady && rootDocument.querySelector('.filter-panel')) {{
     const exactConfirmButton = visibleNodes('.filter-panel button, .filter-panel a, .filter-panel .btn, .filter-panel span, .filter-panel div')
       .filter((el) => ['\u786e\u5b9a', '\u786e\u8ba4', '\u5b8c\u6210'].includes(text(el)))
       .sort((a, b) => {{
@@ -5845,19 +6001,20 @@ def build_apply_recommend_filters_expression(
       }})[0];
     if (exactConfirmButton) {{
       clickElement(exactConfirmButton);
+      exactConfirmed = true;
       await delay(actionDelayMs || 1000);
     }}
   }}
-  const confirmResult = autoConfirm && filterEntries.length > 0 && appliedFilters.length > 0
+  const confirmResult = !strictRun && autoConfirm && filterEntries.length > 0 && appliedFilters.length > 0
     ? await confirmFilterPanel()
-    : {{ clicked: Boolean(confirmButton), reason: 'auto_confirm_disabled_or_no_filters' }};
+    : {{ clicked: exactConfirmed || Boolean(confirmButton), reason: 'auto_confirm_disabled_or_no_filters' }};
   const echoAfterConfirm = captureFilterEcho();
   const panelScanAfter = scanPanelCapabilities();
   for (const [key] of Object.entries(filters || {{}})) {{
     const result = specialFilters[key];
     if (result?.method === 'panel_options') {{
-      const filterItem = findFilterItemV2(key) || findFilterItem(key);
-      result.selectedAfterConfirm = selectedTextsInGroup(filterItem || rootDocument);
+      const filterItem = filterGroup(key);
+      result.selectedAfterConfirm = selectedTextsInGroup(filterItem || (strictKeys.has(key)?null:rootDocument));
     }}
   }}
   const verification = {{}};
@@ -5867,7 +6024,10 @@ def build_apply_recommend_filters_expression(
     const result = specialFilters[key];
     const verifiedBeforeConfirm = valueVerified(key, value, result, echoBeforeConfirm);
     const verifiedAfterConfirm = valueVerified(key, value, result, echoAfterConfirm);
-    const verified = verifiedBeforeConfirm || verifiedAfterConfirm;
+    const verified = strictRun
+      ? (strictReady && (!autoConfirm || exactConfirmed && visibleNodes('.filter-panel').length === 0) &&
+         (strictKeys.has(key) || verifiedBeforeConfirm || verifiedAfterConfirm))
+      : verifiedBeforeConfirm || verifiedAfterConfirm;
     const expectedValues = splitFilterValues(value);
     const verifiedValues = isAgeFilterKey(key)
       ? (verified ? expectedValues : [])
@@ -5976,7 +6136,7 @@ def build_capture_recommend_candidates_expression(max_count: int) -> str:
       activeStatus: firstLineMatching(lines, [/鍦ㄧ嚎|娲昏穬|鍒氬垰|浠婃棩|鏈懆|杩戞湡/]),
       detailTextPreview: raw.slice(0, 500),
       cardIndex: index,
-      candidateId: el.getAttribute('data-geekid') || el.getAttribute('data-geek-id') || el.getAttribute('data-id') || String(index)
+      candidateId: el.getAttribute('data-geekid') || el.getAttribute('data-geek-id') || el.getAttribute('data-id') || ''
     }};
   }};
   const cards = Array.from(document.querySelectorAll('[data-geekid], [data-geek-id], [data-id], .geek-card, .recommend-card, .candidate-card, .card'))
@@ -6001,7 +6161,34 @@ def build_capture_recommend_candidates_expression(max_count: int) -> str:
 """.strip()
 
 
-def build_capture_recommend_candidates_expression_v2(max_count: int) -> str:
+def _recommend_card_identity_javascript() -> str:
+    return """
+  const cardIdentity = (card) => {
+    const nodes = [card, ...(card.querySelectorAll?.('[data-geekid], [data-geek-id]') || [])];
+    const ids = new Set(nodes.flatMap(node => [
+      node.getAttribute?.('data-geekid'), node.getAttribute?.('data-geek-id')
+    ]).filter(Boolean));
+    return ids.size === 1 ? [...ids][0] : '';
+  };
+""".strip()
+
+
+def _recommend_detail_binding_javascript() -> str:
+    return r"""
+  const detailVisible = el => Boolean(el?.getClientRects().length
+    && el.ownerDocument.defaultView.getComputedStyle(el).display !== 'none'
+    && el.ownerDocument.defaultView.getComputedStyle(el).visibility !== 'hidden');
+  const detailRoots = () => [...doc.querySelectorAll(
+    '.resume-common-dialog, .search-resume, .new-resume-online-main-ui, .lib-standard-resume, .resume-layout-wrap, .resume-detail-wrap'
+  )].filter(detailVisible);
+  const uniqueDetailRoot = () => {
+    const roots = detailRoots();
+    return roots.find(el => roots.every(other => el === other || el.contains(other))) || null;
+  };
+""".strip()
+
+
+def build_capture_recommend_candidates_expression_v2(max_count: int, *, minimize: bool = False) -> str:
     return f"""
 (() => {{
   const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
@@ -6023,7 +6210,15 @@ def build_capture_recommend_candidates_expression_v2(max_count: int) -> str:
       && style.visibility !== 'hidden';
   }};
   const firstLineMatching = (lines, patterns) => lines.find((line) => patterns.some((pattern) => pattern.test(line))) || '';
+  const minimized = {json.dumps(minimize)};
+  {_recommend_card_identity_javascript()}
   const parseCard = (el, index) => {{
+    if (minimized) {{
+      return {{
+        candidateId: cardIdentity(el),
+        candidateName: text(el.querySelector('.name, .geek-name'))
+      }};
+    }}
     const raw = text(el);
     const lines = raw.split('\\n').map((line) => line.trim()).filter(Boolean);
     const tags = Array.from(el.querySelectorAll('.tag, .label, .badge, [class*="tag"], [class*="label"]'))
@@ -6048,13 +6243,16 @@ def build_capture_recommend_candidates_expression_v2(max_count: int) -> str:
       activeStatus: firstLineMatching(lines, [/鍦ㄧ嚎|娲昏穬|鍒氬垰|浠婃棩|鏈懆|杩戞湡/]),
       detailTextPreview: raw.slice(0, 800),
       cardIndex: index,
-      candidateId: el.getAttribute('data-geekid') || el.getAttribute('data-geek-id') || el.getAttribute('data-id') || String(index)
+      candidateId: cardIdentity(el) || el.getAttribute('data-id') || ''
     }};
   }};
   const isMainCandidateCard = (el) => {{
     const raw = text(el);
     if (raw.length <= 20) return false;
     const item = el?.matches?.('li.card-item') ? el : el?.closest?.('li.card-item');
+    const guide = '.anonymous-geek-guide-card';
+    if (el.classList?.contains('anonymous-geek-guide-card') || el.closest?.(guide)
+        || (item || el).querySelector?.(guide)) return false;
     const titleText = text((item || el).querySelector?.('div.title, .title'));
     const itemText = text(item || el);
     const hasSimilarRecommendTitle = (titleText.includes('\u4e3a\u4f60\u63a8\u8350') && titleText.includes('\u76f8\u4f3c'))
@@ -6072,8 +6270,8 @@ def build_capture_recommend_candidates_expression_v2(max_count: int) -> str:
   const candidates = [];
   cards.forEach((card) => {{
     const item = parseCard(card, candidates.length);
-    const key = item.candidateId + ':' + item.candidateName + ':' + item.detailTextPreview.slice(0, 60);
-    if (!seen.has(key) && item.candidateName) {{
+    const key = item.candidateId + ':' + item.candidateName + ':' + (item.detailTextPreview || '').slice(0, 60);
+    if ((!seen.has(key) || minimized) && (item.candidateName || minimized)) {{
       seen.add(key);
       candidates.push(item);
     }}
@@ -6223,6 +6421,93 @@ def build_capture_recommend_detail_resume_expression() -> str:
   });
 })()
 """.strip()
+
+
+def build_advance_recommend_viewport_expression(*, to_top: bool = False) -> str:
+    expression = r"""
+(() => {
+  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const doc = frame?.contentDocument || document;
+  const hasChallenge = /验证码|安全验证|访问异常|访问过于频繁/.test((doc.body?.innerText || '').slice(0, 600));
+  if (hasChallenge) return JSON.stringify({advanced: false, reason: 'page_challenge_detected'});
+  const card = [...doc.querySelectorAll('li.card-item[data-geekid], li.card-item[data-geek-id], .candidate-card-wrap[data-geekid], .candidate-card-wrap[data-geek-id], .card-inner[data-geekid], .card-inner[data-geek-id]')]
+    .find(el => el.getClientRects().length);
+  let scroller = card?.parentElement;
+  while (scroller && !(
+    /auto|scroll/.test(doc.defaultView.getComputedStyle(scroller).overflowY)
+    && scroller.scrollHeight > scroller.clientHeight
+  )) scroller = scroller.parentElement;
+  if (!scroller && card && doc.scrollingElement?.contains(card)
+      && doc.scrollingElement.scrollHeight > doc.scrollingElement.clientHeight) {
+    scroller = doc.scrollingElement;
+  }
+  if (!scroller) return JSON.stringify({advanced: false, reason: 'scroll_container_unverified'});
+  const before = scroller.scrollTop;
+  const toTop = __to_top__;
+  scroller.scrollTop = toTop ? 0 : before + Math.max(1, Math.floor(scroller.clientHeight * 0.8));
+  const advanced = toTop ? scroller.scrollTop === 0 : scroller.scrollTop > before;
+  return JSON.stringify({advanced, reason: advanced ? '' : 'end_of_list'});
+})()
+""".strip()
+    return expression.replace("__to_top__", json.dumps(to_top))
+
+
+def build_verified_recommend_detail_expression(binding_token: str | None = None) -> str:
+    """Read the native detail identity or the root created by a verified card open."""
+    expression = r"""
+(() => {
+  const frame = document.querySelector('iframe[src*="/web/frame/recommend"]');
+  const doc = frame?.contentDocument || document;
+  /* binding_helpers */
+  const visible = el => Boolean(el?.getClientRects().length
+    && el.ownerDocument.defaultView.getComputedStyle(el).visibility !== 'hidden');
+  const ownerSelector = '[data-geekid], [data-geek-id]';
+  const details = detailRoots();
+  const identity = el => {
+    const first = el.getAttribute('data-geekid');
+    const second = el.getAttribute('data-geek-id');
+    return first && second && first !== second ? '' : (first || second || '');
+  };
+  const owners = [...new Set(details.map(el => el.closest(ownerSelector)).filter(Boolean))].filter(visible);
+  let owner = owners.length === 1 ? owners[0] : null;
+  let binding = null;
+  if (!owner || !identity(owner)) {
+    const active = doc[Symbol.for('boss-agent.recommend-detail')];
+    if (!__binding_token__ || !active || active.token !== __binding_token__ || active.invalidated
+        || !active.root.isConnected || !active.card.isConnected
+        || active.root.ownerDocument !== doc || uniqueDetailRoot() !== active.root
+        || cardIdentity(active.card) !== active.candidateId || owners.length > 0) {
+      return JSON.stringify({detailOpen: Boolean(details.length), captureStatus: 'detail_identity_unverified'});
+    }
+    binding = active;
+    owner = active.root;
+  }
+  if (owner.matches?.('li.card-item, .candidate-card-wrap')) {
+    return JSON.stringify({detailOpen: true, captureStatus: 'detail_identity_unverified'});
+  }
+  const roots = details.filter(el => binding ? el === owner || owner.contains(el) : el.closest(ownerSelector) === owner);
+  const root = roots.find(el => roots.every(other => other === el || el.contains(other))) || null;
+  if (!root) return JSON.stringify({detailOpen: true, captureStatus: 'detail_container_ambiguous'});
+  const fullDomText = (root.innerText || '').trim();
+  const frames = [...doc.querySelectorAll('iframe[src*="/web/frame/c-resume"]')].filter(visible);
+  const canvasExpected = frames.length > 0 || [...root.querySelectorAll('canvas')].some(visible);
+  const foreignCanvas = frames.length > 1 || frames.some(el =>
+    !root.contains(el) || (el.matches(ownerSelector) && identity(el) !== (binding?.candidateId || identity(owner)))
+  );
+  const resumeFrameSrc = frames[0]?.getAttribute('src') || '';
+  const loading = [...root.querySelectorAll('[aria-busy="true"], .loading, .resume-loading')].some(visible)
+    || fullDomText.split(String.fromCharCode(10)).some(line => /^(?:正在加载(?:中)?|加载中|loading)[.…]*$/i.test(line.trim()));
+  return JSON.stringify({
+    detailOpen: true, detailCandidateId: binding?.candidateId || identity(owner),
+    identitySource: binding ? 'verified_card_open' : 'detail_attribute', fullDomText, canvasExpected, resumeFrameSrc,
+    captureStatus: loading ? 'detail_loading' : foreignCanvas ? 'canvas_identity_unverified' : 'ready'
+  });
+})()
+""".strip()
+    return expression.replace(
+        "/* binding_helpers */",
+        _recommend_card_identity_javascript() + "\n" + _recommend_detail_binding_javascript(),
+    ).replace("__binding_token__", json.dumps(binding_token))
 
 
 def build_capture_recommend_detail_resume_expression_v3() -> str:
@@ -6513,7 +6798,7 @@ def build_capture_recommend_canvas_scrolled_data_urls_expression(max_segments: i
       clientHeight: scrollContainer.clientHeight,
       maxScrollTop,
       step,
-      positions: uniquePositions
+      positions: segments.map(segment => segment.scrollTop)
     }},
     segments
   }});
@@ -6803,7 +7088,9 @@ def build_dismiss_recommend_popup_cards_expression() -> str:
 """.strip()
 
 
-def build_click_recommend_card_greet_expression(escaped_candidate_id: str, card_index: int) -> str:
+def build_click_recommend_card_greet_expression(
+    escaped_candidate_id: str, card_index: int = 0, *, verify_only: bool = False
+) -> str:
     return f"""
 (() => {{
   const candidateId = {escaped_candidate_id};
@@ -6832,47 +7119,25 @@ def build_click_recommend_card_greet_expression(escaped_candidate_id: str, card_
     ? primaryCards
     : Array.from(doc.querySelectorAll('[data-geekid], [data-id], .candidate-card-wrap, .geek-card, .card-inner, li, [class*="card"]')).filter((el) => isVisible(el) && isMainCandidateCard(el))
   );
-  const target = cards.find((el) => candidateId && (
-      el.getAttribute('data-geekid') === candidateId
-      || el.getAttribute('data-id') === candidateId
-      || String(el.dataset?.geekid || el.dataset?.id || '') === candidateId
-    ))
-    || cards[cardIndex]
-    || null;
-  if (!target) return JSON.stringify({{ clicked: false, greeted: false, reason: 'card_not_found', cardIndex }});
-  target.scrollIntoView({{ block: 'center', inline: 'center' }});
-  const buttons = Array.from(target.querySelectorAll('button.btn-greet, .btn-greet, .button-chat-wrap.button-chat, .button-list, .button-list-wrap, button, a, [role="button"], span, div'))
-    .filter(isVisible)
-    .filter((el) => text(el) === '\u6253\u62db\u547c' || /btn-greet|button-chat|button-list/.test(String(el.className || '')))
-    .sort((a, b) => {{
-      const exactButton = Number(b.matches?.('button.btn-greet')) - Number(a.matches?.('button.btn-greet'));
-      if (exactButton) return exactButton;
-      const exactText = Number(text(b) === '\u6253\u62db\u547c') - Number(text(a) === '\u6253\u62db\u547c');
-      if (exactText) return exactText;
-      const ar = a.getBoundingClientRect();
-      const br = b.getBoundingClientRect();
-      return (ar.width * ar.height) - (br.width * br.height);
-    }});
-  const button = buttons[0];
-  if (!button) return JSON.stringify({{ clicked: false, greeted: false, reason: 'card_greet_button_not_found', cardIndex, cardText: text(target).slice(0, 240) }});
-  const real = button.querySelector?.('button.btn-greet') || button;
-  const rect = real.getBoundingClientRect();
-  real.click();
-  return JSON.stringify({{
-    clicked: true,
-    greeted: false,
-    method: 'card_dom_click',
-    status: text(real),
-    cardIndex,
-    button: {{
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height
-    }}
-  }});
+  const verifyOnly = {json.dumps(verify_only)};
+  {_recommend_card_identity_javascript()}
+  const matches = cards.filter((el) => candidateId && cardIdentity(el) === candidateId);
+  const result = (fields) => JSON.stringify({{candidateId, cardIndex, clicked: false, ...fields}});
+  if (matches.length !== 1) return result({{reason: 'candidate_id_not_unique_or_missing'}});
+  const target = matches[0];
+  const buttons = Array.from(target.querySelectorAll('button.btn-greet, .btn-greet, button, [role="button"]'))
+    .filter(isVisible);
+  const observed = buttons.map(text);
+  const success = {json.dumps(CONFIRMED_CONTACT_STATES)};
+  const status = observed.find((label) => success.includes(label)) || '';
+  const pending = buttons.filter((button) => text(button) === '打招呼');
+  if (verifyOnly) return result({{status, observed}});
+  if (status) return result({{status, reason: 'already_contacted'}});
+  if (pending.length !== 1 || pending[0].disabled || pending[0].getAttribute('aria-disabled') === 'true') {{
+    return result({{reason: 'card_greet_button_not_found'}});
+  }}
+  pending[0].click();
+  return result({{clicked: true, method: 'card_dom_click'}});
 }})()
 """.strip()
 
@@ -6966,8 +7231,8 @@ def build_close_recommend_detail_expression() -> str:
 """.strip()
 
 
-def build_close_recommend_detail_expression_v2() -> str:
-    return r"""
+def build_close_recommend_detail_expression_v2(*, locate_only: bool = False) -> str:
+    expression = r"""
 (() => {
   const text = (el) => el ? String(el.innerText || el.textContent || '').trim() : '';
   const isVisible = (el) => {
@@ -6991,7 +7256,8 @@ def build_close_recommend_detail_expression_v2() -> str:
   if (!detail) {
     return JSON.stringify({ closed: false, reason: 'detail_not_open' });
   }
-  const root = detail.closest('.dialog-wrap.active, .boss-popup__wrapper, .boss-dialog__body, .resume-layout-wrap')
+  const root = detail.closest('.lib-standard-resume, .resume-common-dialog, .dialog-wrap.active, .boss-popup__wrapper')
+    || detail.closest('.boss-dialog__body, .resume-layout-wrap')
     || detail;
   const selectors = [
     '.close-btn',
@@ -7008,31 +7274,16 @@ def build_close_recommend_detail_expression_v2() -> str:
     return JSON.stringify({ closed: false, reason: 'close_button_not_found' });
   }
   const rect = button.getBoundingClientRect();
-  const viewWidth = doc.defaultView?.innerWidth || doc.documentElement.clientWidth || 0;
-  const isTopRight = rect.top <= 48 && rect.left >= Math.max(0, viewWidth - 180);
-  if (isTopRight) {
-    return JSON.stringify({
-      closed: false,
-      reason: 'unsafe_top_right_close_button',
-      selector: button.className || button.tagName,
-      button: {
-        x: rect.left + rect.width / 2,
-        y: rect.top + rect.height / 2,
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height
-      }
-    });
-  }
-  button.click();
+  const frameRect = frame ? frame.getBoundingClientRect() : {left:0, top:0};
+  const click = __click__;
+  if (click) button.click();
   return JSON.stringify({
-    closed: true,
-    method: 'dom_click',
+    closed: click,
+    method: click ? 'dom_click' : 'locate',
     selector: button.className || button.tagName,
     button: {
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
+      x: frameRect.left + rect.left + rect.width / 2,
+      y: frameRect.top + rect.top + rect.height / 2,
       left: rect.left,
       top: rect.top,
       width: rect.width,
@@ -7041,6 +7292,7 @@ def build_close_recommend_detail_expression_v2() -> str:
   });
 })()
 """.strip()
+    return expression.replace("__click__", json.dumps(not locate_only))
 
 
 def build_capture_conversation_expression() -> str:

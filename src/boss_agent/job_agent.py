@@ -13,13 +13,13 @@ from urllib.request import Request, urlopen
 MIN_SEMANTIC_SCORE = 75
 
 
-def load_local_llm_env(path: Path | None = None) -> dict[str, bool]:
-    """Load git-ignored local LLM settings without overwriting process env."""
+def load_local_llm_env(path: Path | None = None, *, override: bool = False) -> dict[str, bool]:
+    """Load local LLM settings, optionally preferring the local configuration."""
     env_path = path or Path(__file__).resolve().parents[2] / ".env"
     loaded: dict[str, bool] = {}
     if not env_path.exists():
         return loaded
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -31,7 +31,11 @@ def load_local_llm_env(path: Path | None = None) -> dict[str, bool]:
             "BOSS_AGENT_LLM_MODEL",
         }:
             continue
-        os.environ.setdefault(name, value.strip().strip('"').strip("'"))
+        setting = value.strip().strip('"').strip("'")
+        if override:
+            os.environ[name] = setting
+        else:
+            os.environ.setdefault(name, setting)
         loaded[name] = bool(os.environ.get(name))
     return loaded
 

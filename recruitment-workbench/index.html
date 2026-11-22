@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>招聘工作台</title>
+<link rel="icon" href="/vendor/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vendor/app.css?v=match-percent">
+<script src="/app.js?v=request-examples" defer></script><script src="/condition-editor.js?v=match-percent" defer></script>
+<script src="/operations.js?v=match-percent" defer></script><script src="/task-workflow.js?v=greet-during-screening" defer></script>
+<script src="/reviews.js?v=hard-requirements" defer></script><script src="/motion.js?v=match-percent" defer></script>
+</head>
+<body>
+<svg class="icon-sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-tasks" viewBox="0 0 20 20"><path d="M4 3.5h12A1.5 1.5 0 0 1 17.5 5v10A1.5 1.5 0 0 1 16 16.5H4A1.5 1.5 0 0 1 2.5 15V5A1.5 1.5 0 0 1 4 3.5Z"/><path d="M6 7.5h8M6 10.5h8M6 13.5h5"/></symbol>
+  <symbol id="i-users" viewBox="0 0 20 20"><circle cx="8" cy="7" r="2.6"/><path d="M3 16c.6-2.6 2.6-4 5-4s4.4 1.4 5 4"/><path d="M13.2 5.2a2.4 2.4 0 0 1 0 4.6M14.4 12.4c1.5.5 2.4 1.7 2.8 3.4"/></symbol>
+  <symbol id="i-runs" viewBox="0 0 20 20"><path d="M3 15.5V9M7.6 15.5V5M12.2 15.5v-4M16.8 15.5V7"/><path d="M2.5 16.5h15"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 20 20"><circle cx="10" cy="10" r="2.6"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4"/></symbol>
+  <symbol id="i-jobs" viewBox="0 0 20 20"><rect x="2.5" y="6" width="15" height="10" rx="1.6"/><path d="M7.4 6V4.8c0-.7.6-1.3 1.3-1.3h2.6c.7 0 1.3.6 1.3 1.3V6M2.5 10.5h15"/></symbol>
+  <symbol id="i-diff" viewBox="0 0 20 20"><path d="M6 3v10.5M6 16.5V15M14 17V6.5M14 3.5V5"/><circle cx="6" cy="13.5" r="1.6"/><circle cx="14" cy="4.8" r="1.6"/><path d="M7.6 13.5h4.8a1.6 1.6 0 0 0 1.6-1.6V6.4"/></symbol>
+  <symbol id="i-report" viewBox="0 0 20 20"><path d="M5 2.5h6.5L15 6v11.5H5z"/><path d="M11.2 2.6V6H15M7.5 9.5h5M7.5 12.5h5M7.5 15.2h3"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 20 20"><path d="M3 4.2c0-.9.8-1.7 1.7-1.7H17v13.2H4.7c-.9 0-1.7.7-1.7 1.6z"/><path d="M3 17.3c0 .4.3.7.7.7H17M6.4 6.6h7M6.4 9.6h7"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 20 20"><path d="M3 4.6c0-.9.7-1.6 1.6-1.6h10.8c.9 0 1.6.7 1.6 1.6v7c0 .9-.7 1.6-1.6 1.6H8.2L4 16.4v-3.2z"/><path d="M6.6 7h6.8M6.6 9.6h4.4"/></symbol>
+  <symbol id="i-jd" viewBox="0 0 20 20"><path d="M6.5 2.5h5l3 3v9.2c0 .8-.6 1.3-1.3 1.3H6.5c-.8 0-1.3-.5-1.3-1.3V3.8c0-.8.5-1.3 1.3-1.3Z"/><path d="M11.3 2.6V5.7h3.2M7.8 9h4.4M7.8 11.6h4.4M7.8 14.2h2.6"/></symbol>
+  <symbol id="i-more" viewBox="0 0 20 20"><circle cx="5.2" cy="10" r="1.2"/><circle cx="10" cy="10" r="1.2"/><circle cx="14.8" cy="10" r="1.2"/></symbol>
+</svg>
+
+<div class="shell flex min-h-screen">
+  <aside class="rail">
+    <div class="rail-aurora" aria-hidden="true"><span></span><span></span></div>
+    <a class="rail-brand" href="#tasks">
+      <span class="rail-mark" aria-hidden="true">聘</span>
+      <span class="rail-name">招聘工作台<small>BOSS 推荐牛人</small></span>
+    </a>
+    <nav class="rail-nav" aria-label="工作台导航">
+      <p class="rail-label">工作流</p>
+      <button data-page="tasks" class="rail-item active"><svg class="icon" aria-hidden="true"><use href="#i-tasks"></use></svg>招聘任务</button>
+      <button data-page="review" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg>候选人</button>
+      <button data-page="runs" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-runs"></use></svg>运行记录</button>
+      <p class="rail-label">配置</p>
+      <button data-page="settings" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>系统设置</button>
+      <details class="rail-group">
+        <summary><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>更多工具</summary>
+        <button data-page="jobs" class="rail-item" data-live-only><svg class="icon" aria-hidden="true"><use href="#i-jobs"></use></svg>岗位管理</button>
+        <button data-page="differences" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-diff"></use></svg>规则差异</button>
+        <button data-page="candidates" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-report"></use></svg>已导入的报告</button>
+        <button data-page="catalog" class="rail-item"><svg class="icon" aria-hidden="true"><use href="#i-catalog"></use></svg>专业目录</button>
+        <button data-page="chat" class="rail-item" data-live-only><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg>沟通与简历</button>
+        <button data-page="jd" class="rail-item" data-live-only><svg class="icon" aria-hidden="true"><use href="#i-jd"></use></svg>JD 助手</button>
+      </details>
+    </nav>
+    <p class="rail-foot"><i></i><span id="connection-label">正在连接工作台</span></p>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumbs"><span>招聘管理</span><b aria-hidden="true">/</b><strong id="crumb">招聘任务</strong></div>
+      <div class="topbar-actions">
+        <span id="mode-label" class="mode-chip" role="status"></span>
+        <label class="button is-small import">导入筛选报告<input id="import" type="file" accept=".json,application/json"></label>
+      </div>
+    </header>
+    <main class="canvas">
+      <div class="view" id="content" aria-live="polite"></div>
+    </main>
+  </div>
+</div>
+
+<dialog id="detail" class="sheet sheet--md" aria-labelledby="detail-title"><div class="dialog-head"><div><small>候选人复核</small><h2 id="detail-title"></h2></div><button class="dialog-close" id="close-detail" aria-label="关闭">×</button></div><div id="detail-body" class="dialog-body"></div></dialog>
+<dialog id="review-detail" class="sheet" aria-labelledby="review-title" aria-describedby="review-position"><div class="dialog-head"><div><h2 id="review-title">候选人详情</h2><p id="review-position"></p></div><button class="dialog-close" data-review-close aria-label="关闭">×</button></div><div id="review-body" class="dialog-body"></div></dialog>
+<dialog id="confirm-dialog" class="sheet sheet--sm" aria-labelledby="confirm-title"><form method="dialog" class="form confirm-form">
+  <h2 id="confirm-title">请确认操作</h2><p id="confirm-text"></p><div class="controls">
+  <button class="button" value="cancel" autofocus>返回</button><button class="button is-primary" id="confirm-submit" value="ok">继续</button></div>
+</form></dialog>
+</body></html>

@@ -121,3 +121,21 @@ def test_role_evidence_rejects_manager_assistant() -> None:
     assert job_agent.has_decision_maker_role_evidence("招聘顾问") is False
     assert job_agent.has_decision_maker_role_evidence("招聘经理") is True
     assert job_agent.has_decision_maker_role_evidence("CEO") is True
+
+
+def test_local_llm_settings_can_override_stale_process_settings(tmp_path, monkeypatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "BOSS_AGENT_LLM_API_KEY=new-test-key\nBOSS_AGENT_LLM_MODEL=deepseek-flash\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setenv("BOSS_AGENT_LLM_API_KEY", "old-test-key")
+    monkeypatch.setenv("BOSS_AGENT_LLM_MODEL", "old-model")
+
+    job_agent.load_local_llm_env(env_path)
+    assert job_agent.os.environ["BOSS_AGENT_LLM_API_KEY"] == "old-test-key"
+
+    loaded = job_agent.load_local_llm_env(env_path, override=True)
+    assert loaded["BOSS_AGENT_LLM_API_KEY"] is True
+    assert job_agent.os.environ["BOSS_AGENT_LLM_API_KEY"] == "new-test-key"
+    assert job_agent.os.environ["BOSS_AGENT_LLM_MODEL"] == "deepseek-flash"

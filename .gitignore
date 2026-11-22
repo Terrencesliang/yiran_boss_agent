@@ -39,3 +39,8 @@ reports/
 Thumbs.db
 .idea/
 .vscode/
+
+# Recruitment workbench runtime
+/recruitment-workbench/.runtime/
+/recruitment-workbench/.demo-runtime/
+/recruitment-workbench/.ui-backup-*/

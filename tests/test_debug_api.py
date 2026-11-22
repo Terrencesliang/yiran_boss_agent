@@ -1084,7 +1084,17 @@ def test_reply_unread_with_knowledge_stops_when_job_filter_fails(tmp_path: Path)
     assert result["processedCount"] == 0
 
 
-def test_request_resume_new_greetings_matching_online_resume_sends_first_common_phrase() -> None:
+def _freeze_resume_request_precheck_date(monkeypatch) -> None:
+    class FixtureDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 5, 26)
+
+    monkeypatch.setattr("boss_agent.cli.date", FixtureDate)
+
+
+def test_request_resume_new_greetings_matching_online_resume_sends_first_common_phrase(monkeypatch) -> None:
+    _freeze_resume_request_precheck_date(monkeypatch)
     client = RequestResumeFakeClient()
 
     result = _request_resume_new_greetings(
@@ -1145,7 +1155,8 @@ def test_request_resume_new_greetings_salary_precheck_then_resume_ocr_then_commo
     assert client.sent_messages == 1
 
 
-def test_request_resume_new_greetings_skips_existing_resume_request() -> None:
+def test_request_resume_new_greetings_skips_existing_resume_request(monkeypatch) -> None:
+    _freeze_resume_request_precheck_date(monkeypatch)
     client = RequestResumeFakeClient(conversation_text="\u5bf9\u65b9\u60f3\u53d1\u9001\u9644\u4ef6\u7b80\u5386\u7ed9\u60a8")
 
     result = _request_resume_new_greetings(
@@ -1188,7 +1199,8 @@ def test_request_resume_new_greetings_stops_when_job_filter_fails() -> None:
     assert result["processedCount"] == 0
 
 
-def test_request_resume_new_greetings_skips_when_online_resume_missing() -> None:
+def test_request_resume_new_greetings_skips_when_online_resume_missing(monkeypatch) -> None:
+    _freeze_resume_request_precheck_date(monkeypatch)
     client = RequestResumeFakeClient(online_resume_opened=False)
 
     result = _request_resume_new_greetings(
@@ -1215,7 +1227,8 @@ def test_request_resume_new_greetings_skips_when_online_resume_missing() -> None
     assert client.request_resume_clicks == 0
 
 
-def test_request_resume_new_greetings_skips_when_online_resume_not_match() -> None:
+def test_request_resume_new_greetings_skips_when_online_resume_not_match(monkeypatch) -> None:
+    _freeze_resume_request_precheck_date(monkeypatch)
     client = RequestResumeFakeClient(resume_text="\u5019\u9009\u4eba\u67093\u5e74\u884c\u653f\u7ecf\u9a8c")
 
     result = _request_resume_new_greetings(
@@ -1722,6 +1735,27 @@ def test_apply_recommend_filters_mock_records_multiselect_values() -> None:
     assert result["filterTasks"][1]["expectedValues"] == ["10-15K", "15-20K"]
 
 
+def test_age_and_gender_are_confirmed_together(monkeypatch):
+    from boss_agent.chrome_debug import ChromeDebugClient
+
+    client = ChromeDebugClient("http://example.invalid")
+    monkeypatch.setattr(client, "list_pages", lambda: [])
+    monkeypatch.setattr(client, "_select_page", lambda pages, url_contains: {"webSocketDebuggerUrl": "ws://mock"})
+    monkeypatch.setattr(client, "_evaluate_json", lambda *args, **kwargs: {
+        "needsConfirm": True, "verification": {"性别": {"verified": True}},
+    })
+    monkeypatch.setattr(client, "_apply_recommend_age_slider", lambda **kwargs: {"applied": True, "verified": True})
+    monkeypatch.setattr(client, "_verify_recommend_result_filters", lambda *args: {"failedFilters": []})
+    monkeypatch.setattr("boss_agent.chrome_debug.time.sleep", lambda _: None)
+    filters = {"年龄": "25-35", "性别": "女"}
+    for panel_closed in (False, True):
+        monkeypatch.setattr(client, "_confirm_recommend_filter_panel",
+                            lambda websocket, exact_only: {"clicked": exact_only, "panelClosed": panel_closed})
+        result = client.apply_recommend_filters("", "", filters, max_filter_retries=0, confirmed_page_filters=True)
+        assert result["filterVerificationPassed"] is panel_closed
+        assert all(item["verified"] is panel_closed for item in result["verification"].values())
+
+
 def _age_slider_state(left: int, right: int) -> dict:
     return {
         "frameUrl": "mock",
@@ -1752,8 +1786,14 @@ def _age_slider_unlimited_state(left: int, right: int | None) -> dict:
     }
 
 
+class PreparedAgeSliderClient(ChromeDebugClient):
+    def _prepare_recommend_age_slider(self, websocket_url: str, reopen: bool = False) -> dict:
+        assert websocket_url == "ws://mock"
+        return {"panelOpen": True, "ageFound": True, "dotCount": 2}
+
+
 def test_apply_recommend_age_slider_closed_loop_reaches_target() -> None:
-    class AgeClient(ChromeDebugClient):
+    class AgeClient(PreparedAgeSliderClient):
         def __init__(self) -> None:
             super().__init__(endpoint="http://127.0.0.1:9222")
             self.states = [
@@ -1787,7 +1827,7 @@ def test_apply_recommend_age_slider_closed_loop_reaches_target() -> None:
 
 
 def test_apply_recommend_age_slider_reports_unverified_when_stuck() -> None:
-    class StuckAgeClient(ChromeDebugClient):
+    class StuckAgeClient(PreparedAgeSliderClient):
         def __init__(self) -> None:
             super().__init__(endpoint="http://127.0.0.1:9222")
             self.drag_count = 0
@@ -1811,7 +1851,7 @@ def test_apply_recommend_age_slider_reports_unverified_when_stuck() -> None:
 
 
 def test_apply_recommend_age_slider_drags_right_handle_from_unlimited() -> None:
-    class UnlimitedAgeClient(ChromeDebugClient):
+    class UnlimitedAgeClient(PreparedAgeSliderClient):
         def __init__(self) -> None:
             super().__init__(endpoint="http://127.0.0.1:9222")
             self.states = [
@@ -1864,7 +1904,7 @@ def test_drag_age_handle_treats_chinese_unlimited_as_draggable() -> None:
 
 
 def test_apply_recommend_age_slider_reports_when_unlimited_stays_unlimited() -> None:
-    class StuckUnlimitedAgeClient(ChromeDebugClient):
+    class StuckUnlimitedAgeClient(PreparedAgeSliderClient):
         def __init__(self) -> None:
             super().__init__(endpoint="http://127.0.0.1:9222")
             self.drag_count = 0

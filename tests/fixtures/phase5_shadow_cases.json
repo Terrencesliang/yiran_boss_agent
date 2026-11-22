@@ -1,0 +1,1034 @@
+[
+  {
+    "id": "major-standard",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "MAJOR_MATCHED",
+    "tag": "major",
+    "quote": "示例大学 软件工程 本科 2020-2024"
+  },
+  {
+    "id": "major-outside",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024",
+    "status": "FAIL",
+    "expected": [
+      "PASS",
+      "FAIL"
+    ],
+    "reason": "MAJOR_OUT_OF_SCOPE",
+    "tag": "major",
+    "quote": "教育经历完整"
+  },
+  {
+    "id": "major-ai-official",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 人工智能 本科 2020-2024",
+    "status": "FAIL",
+    "expected": [
+      "PASS",
+      "FAIL"
+    ],
+    "reason": "MAJOR_OUT_OF_SCOPE",
+    "tag": "major",
+    "quote": "人工智能"
+  },
+  {
+    "id": "major-business-or",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "operator": "OR",
+        "conditions": [
+          {
+            "field": "major_group",
+            "operator": "equals",
+            "value": "计算机类"
+          },
+          {
+            "field": "major",
+            "operator": "equals",
+            "value": "人工智能"
+          }
+        ]
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 人工智能 本科 2020-2024",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "MAJOR_MATCHED",
+    "tag": "major",
+    "quote": "人工智能"
+  },
+  {
+    "id": "major-missing",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "学历：本科",
+    "status": "UNKNOWN",
+    "expected": [
+      "PASS",
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_NOT_PROVIDED",
+    "tag": "major"
+  },
+  {
+    "id": "major-alias",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 计科 本科 2020-2024",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "MAJOR_MATCHED",
+    "tag": "major",
+    "quote": "计科"
+  },
+  {
+    "id": "major-ocr-typo",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "",
+    "status": "UNKNOWN",
+    "expected": [
+      "PASS",
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_UNMAPPED",
+    "tag": "major",
+    "ocr": "教育经历完整\n教育经历\n示例大学 软件工呈 本科 2020-2024",
+    "quote": "软件工呈"
+  },
+  {
+    "id": "degree-major-separate",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n甲大学 软件工程 大专 2015-2018\n乙大学 通信工程 本科 2020-2024",
+    "status": "FAIL",
+    "expected": [
+      "FAIL",
+      "PASS"
+    ],
+    "reason": "MAJOR_OUT_OF_SCOPE",
+    "tag": "major",
+    "quote": "软件工程"
+  },
+  {
+    "id": "major-many-records",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n甲大学 通信工程 本科 2014-2018\n乙大学 软件工程 本科 2020-2024",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "MAJOR_MATCHED",
+    "tag": "major",
+    "quote": "软件工程"
+  },
+  {
+    "id": "major-citation-conflict",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "CONFLICT",
+    "expected": [
+      "PASS",
+      "CONFLICT"
+    ],
+    "reason": "MAJOR_SOURCE_CONFLICT",
+    "tag": "major",
+    "ocr": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024",
+    "quote": "通信工程"
+  },
+  {
+    "id": "major-no-exclusion-coverage",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历\n示例大学 通信工程 本科 2020-2024",
+    "status": "UNKNOWN",
+    "expected": [
+      "PASS",
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_SCOPE_UNCLEAR",
+    "tag": "major",
+    "quote": "通信工程"
+  },
+  {
+    "id": "major-undefined-scope",
+    "hard": [
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机相关专业"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_SCOPE_UNCLEAR",
+    "tag": "major",
+    "quote": "软件工程"
+  },
+  {
+    "id": "hr-three",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-04-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "quote": "招聘专员"
+  },
+  {
+    "id": "hr-eight",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-09-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "quote": "招聘专员"
+  },
+  {
+    "id": "hr-leap-exact",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2024-02-01 至 2025-02-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2024-02-01"
+  },
+  {
+    "id": "hr-over",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2024-02-01 至 2025-02-02 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "HR_EXPERIENCE_EXCEEDS_MAX",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2025-02-02"
+  },
+  {
+    "id": "hr-month-end",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "lte",
+        "value": 1
+      }
+    ],
+    "dom": "工作经历\n2024-01-31 至 2024-02-29 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2024-02-29"
+  },
+  {
+    "id": "hr-month-end-over",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "lte",
+        "value": 1
+      }
+    ],
+    "dom": "工作经历\n2024-01-31 至 2024-03-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "HR_EXPERIENCE_EXCEEDS_MAX",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2024-03-01"
+  },
+  {
+    "id": "hr-overlap",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-09-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选\n2025-03-01 至 2025-10-01 公司：乙公司；岗位：HR 助理",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "edge": true,
+    "quote": "乙公司"
+  },
+  {
+    "id": "hr-internship-and-employed",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "gte",
+        "value": 4
+      }
+    ],
+    "dom": "实习经历\n2025-01-01 至 2025-04-01 公司：甲公司；岗位：招聘助理\n正式工作经历\n2025-05-01 至 2025-09-01 公司：乙公司；岗位：招聘专员",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "quote": "招聘助理"
+  },
+  {
+    "id": "hr-only-start",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n岗位：招聘专员\n入职日期：2025-01",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_EXPERIENCE_UNKNOWN_UPPER_BOUND",
+    "tag": "hr",
+    "quote": "入职日期"
+  },
+  {
+    "id": "hr-only-end",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n岗位：招聘专员\n结束日期：2025-09",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_EXPERIENCE_UNKNOWN_UPPER_BOUND",
+    "tag": "hr",
+    "quote": "结束日期"
+  },
+  {
+    "id": "hr-uncertain-month",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2024.01 至 2025.01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_RELEVANCE_UNCERTAIN",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2024.01"
+  },
+  {
+    "id": "hr-lower-exceeds-with-unbounded",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2023-01-01 至 2025-01-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选\n岗位：HR 助理\n入职日期：2025-03",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "HR_EXPERIENCE_EXCEEDS_MAX",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2023-01-01"
+  },
+  {
+    "id": "hr-no-observation",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "学历：本科",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_EXPERIENCE_MISSING_EVIDENCE",
+    "tag": "hr"
+  },
+  {
+    "id": "hr-non-hr-incomplete",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-09-01 公司：甲公司；岗位：销售专员",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_EXPERIENCE_MISSING_EVIDENCE",
+    "tag": "hr",
+    "warnings": true
+  },
+  {
+    "id": "hr-explicit-zero",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作及实习经历完整\n无HR经历",
+    "status": "PASS",
+    "expected": [
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "tag": "hr",
+    "quote": "无HR经历"
+  },
+  {
+    "id": "hr-zero-minimum",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "gt",
+        "value": 0
+      }
+    ],
+    "dom": "工作及实习经历完整\n无HR经历",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "HR_EXPERIENCE_BELOW_MIN",
+    "tag": "hr",
+    "quote": "无HR经历"
+  },
+  {
+    "id": "hr-mixed",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "gt",
+        "value": 0
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-09-01 公司：甲公司；岗位：销售专员\n职责：产品销售；候选人邀约",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_RELEVANCE_UNCERTAIN",
+    "tag": "hr",
+    "quote": "候选人邀约"
+  },
+  {
+    "id": "hr-date-conflict",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-09-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "CONFLICT",
+    "expected": [
+      "CONFLICT"
+    ],
+    "reason": "HR_EXPERIENCE_DATE_CONFLICT",
+    "tag": "hr",
+    "ocr": "工作经历\n2025-01-01 至 2025-11-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "quote": "2025-11-01"
+  },
+  {
+    "id": "all-and",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024\n工作经历\n2025-01-01 至 2025-06-01 公司：甲公司；岗位：招聘专员\n职责：简历筛选",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "HR_EXPERIENCE_WITHIN_RANGE",
+    "quote": "招聘专员"
+  },
+  {
+    "id": "fail-and-unknown",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "学历：大专",
+    "status": "FAIL",
+    "expected": [
+      "FAIL",
+      "UNKNOWN"
+    ],
+    "reason": "EDUCATION_OUT_OF_SCOPE",
+    "quote": "大专",
+    "soft": [
+      {
+        "field": "hands_on_tools",
+        "operator": "has_any",
+        "value": [
+          "Agent"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "all-unknown",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "技能：Excel",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN",
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_NOT_PROVIDED"
+  },
+  {
+    "id": "or-all-failed",
+    "hard": [
+      {
+        "operator": "OR",
+        "conditions": [
+          {
+            "field": "major_group",
+            "operator": "equals",
+            "value": "计算机类"
+          },
+          {
+            "field": "major",
+            "operator": "equals",
+            "value": "软件工程"
+          }
+        ]
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "MAJOR_OUT_OF_SCOPE",
+    "quote": "通信工程"
+  },
+  {
+    "id": "and-conflict",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      },
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "CONFLICT",
+    "expected": [
+      "PASS",
+      "CONFLICT",
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_SOURCE_CONFLICT",
+    "ocr": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024",
+    "quote": "通信工程"
+  },
+  {
+    "id": "not-unknown",
+    "hard": [
+      {
+        "operator": "NOT",
+        "conditions": [
+          {
+            "field": "major_group",
+            "operator": "equals",
+            "value": "计算机类"
+          }
+        ]
+      }
+    ],
+    "dom": "学历：本科",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "MAJOR_NOT_PROVIDED"
+  },
+  {
+    "id": "identity-conflict",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "CAPTURE_FAILED",
+    "expected": [],
+    "reason": "CAPTURE_IDENTITY_MISMATCH",
+    "invalidateIdentity": true
+  },
+  {
+    "id": "evidence-invalid",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN",
+      "UNKNOWN"
+    ],
+    "reason": "EVIDENCE_REFERENCE_INVALID",
+    "invalidateEvidence": true
+  },
+  {
+    "id": "bonus-cannot-rescue",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024\n实操工具：Agent",
+    "status": "FAIL",
+    "expected": [
+      "PASS",
+      "FAIL"
+    ],
+    "reason": "MAJOR_OUT_OF_SCOPE",
+    "soft": [
+      {
+        "field": "hands_on_tools",
+        "operator": "has_any",
+        "value": [
+          "Agent"
+        ]
+      }
+    ],
+    "quote": "通信工程"
+  },
+  {
+    "id": "bonus-when-qualified",
+    "hard": [
+      {
+        "field": "education_level",
+        "operator": "gte",
+        "value": "bachelor"
+      },
+      {
+        "field": "major_group",
+        "operator": "equals",
+        "value": "计算机类"
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024\n实操工具：Agent",
+    "status": "PASS",
+    "expected": [
+      "PASS",
+      "PASS"
+    ],
+    "reason": "MAJOR_MATCHED",
+    "soft": [
+      {
+        "operator": "OR",
+        "conditions": [
+          {
+            "field": "hands_on_tools",
+            "operator": "has_any",
+            "value": [
+              "Agent"
+            ]
+          },
+          {
+            "field": "hands_on_tools",
+            "operator": "has_any",
+            "value": [
+              "Figma"
+            ]
+          }
+        ]
+      }
+    ],
+    "score": 100,
+    "quote": "软件工程"
+  },
+  {
+    "id": "hr-nonzero-below-min",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "gte",
+        "value": 6
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-04-01 公司：甲公司；岗位：招聘专员",
+    "status": "FAIL",
+    "expected": [
+      "FAIL"
+    ],
+    "reason": "HR_EXPERIENCE_BELOW_MIN",
+    "tag": "hr",
+    "edge": true,
+    "quote": "2025-04-01"
+  },
+  {
+    "id": "hr-capture-partial-unknown-upper",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-04-01 公司：甲公司；岗位：招聘专员",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_EXPERIENCE_UNKNOWN_UPPER_BOUND",
+    "tag": "hr",
+    "warnings": true
+  },
+  {
+    "id": "hr-overlapping-sources-identity-unresolved",
+    "hard": [
+      {
+        "field": "hr_experience_months",
+        "operator": "between",
+        "value": [
+          0,
+          12
+        ]
+      }
+    ],
+    "dom": "工作经历\n2025-01-01 至 2025-08-01 公司：甲公司；岗位：招聘专员",
+    "ocr": "工作经历\n2025-02-01 至 2025-09-01 公司：甲公司；岗位：招聘专员",
+    "status": "UNKNOWN",
+    "expected": [
+      "UNKNOWN"
+    ],
+    "reason": "HR_RECORD_IDENTITY_UNRESOLVED",
+    "tag": "hr",
+    "quote": "2025-09-01"
+  },
+  {
+    "id": "not-conflict",
+    "hard": [
+      {
+        "operator": "NOT",
+        "conditions": [
+          {
+            "field": "major_group",
+            "operator": "equals",
+            "value": "计算机类"
+          }
+        ]
+      }
+    ],
+    "dom": "教育经历完整\n教育经历\n示例大学 软件工程 本科 2020-2024",
+    "ocr": "教育经历完整\n教育经历\n示例大学 通信工程 本科 2020-2024",
+    "status": "CONFLICT",
+    "expected": [
+      "CONFLICT"
+    ],
+    "reason": "MAJOR_SOURCE_CONFLICT",
+    "quote": "通信工程"
+  }
+]

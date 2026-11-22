@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import asdict, replace
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from boss_agent.knowledge_base import load_knowledge_base
 from boss_agent.knowledge_base import normalize_text
+from boss_agent.job_profile import JobProfile, ScoreDimension, apply_job_profile
+from boss_agent.rule_engine import ResumeEvidence, SemanticJudge, combine_status, evaluate_condition, extract_resume_evidence, scope_education_evidence
+from boss_agent.task_schema import RecruitmentTask, iter_criteria
+from boss_agent.task_validator import RecruitmentTaskBlocked, is_sensitive, task_blockers
 
 
 BUSINESS_KEYWORDS = (
@@ -201,3 +208,190 @@ def _keywords_from_text(text: str) -> list[str]:
 
 def _keyword_overlap(keywords: list[str], target: str) -> int:
     return len({keyword for keyword in keywords if keyword and keyword in target})
+
+def _scoring_dimensions(task: RecruitmentTask, configured: list[ScoreDimension]) -> list[ScoreDimension]:
+    def signature(condition) -> str:
+        data = asdict(condition)
+
+        def without_source(node: dict) -> dict:
+            if "conditions" in node:
+                return {**node, "conditions": [without_source(child) for child in node["conditions"]]}
+            return {key: value for key, value in node.items() if key != "source"}
+
+        return json.dumps(without_source(data), sort_keys=True, ensure_ascii=False)
+
+    dimensions = list(configured)
+    known = {signature(item.condition) for item in dimensions}
+    names = {item.name for item in dimensions}
+    fallback_weight = sum(item.weight for item in dimensions) / len(dimensions) if dimensions else 1
+    for index, condition in enumerate(task.soft_preferences, 1):
+        key = signature(condition)
+        if key in known:
+            continue
+        name = f"preference_{index}"
+        while name in names:
+            name += "_request"
+        dimensions.append(ScoreDimension(name, condition, fallback_weight))
+        names.add(name)
+        known.add(key)
+    return dimensions
+
+
+def prepare_recruitment_preview(
+    task: RecruitmentTask, profile: JobProfile | None = None, template: str | None = None,
+) -> tuple[RecruitmentTask, list[ScoreDimension]]:
+    """Validate the merged requirements before any candidate collection."""
+    if template is not None and profile is None:
+        raise ValueError("template_requires_job_profile")
+    selected = profile.select(template) if profile else None
+    if profile:
+        task = apply_job_profile(task, profile, template)
+    if selected:
+        for dimension in selected.scoring:
+            # Dataclass callers get the same sensitive-field check as JSON callers.
+            if any(is_sensitive(rule) for rule in iter_criteria(dimension.condition)):
+                raise ValueError("unsupported_sensitive_recruitment_condition")
+    blockers = [item for item in task_blockers(task) if item != "target_success_count_exceeds_max_checks"]
+    if selected and selected.scoring:
+        blockers = [item for item in blockers if item != "criteria_required"]
+    if blockers:
+        raise RecruitmentTaskBlocked(blockers)
+    return task, selected.scoring if selected else []
+
+
+def _finding_has_source_support(finding, sources: dict[str, str]) -> bool:
+    if finding.status == "UNKNOWN":
+        return False
+    if finding.children:
+        decisive = [child for child in finding.children if child.status == finding.status]
+        if finding.field == "NOT":
+            return _finding_has_source_support(finding.children[0], sources)
+        if finding.field == "OR" and finding.status == "PASS" or finding.field == "AND" and finding.status == "FAIL":
+            return any(_finding_has_source_support(child, sources) for child in decisive)
+        return len(decisive) == len(finding.children) and all(
+            _finding_has_source_support(child, sources) for child in decisive
+        )
+    return bool(finding.evidence) and all(
+        not item.conflict and item.quote.strip() and item.source in sources
+        and 0 <= item.start < item.end <= len(sources[item.source])
+        and sources[item.source][item.start:item.end] == item.quote
+        for item in finding.evidence
+    )
+
+
+def rank_recruitment_preview(
+    task: RecruitmentTask,
+    candidates: list[dict[str, Any]],
+    *,
+    profile: JobProfile | None = None,
+    template: str | None = None,
+    judge: SemanticJudge | None = None,
+    default_max_checks: int = 200,
+    as_of: date | None = None,
+) -> dict:
+    """Evaluate a bounded candidate list without involving a browser or sending."""
+    task, configured_dimensions = prepare_recruitment_preview(task, profile, template)
+    if type(default_max_checks) is not int or default_max_checks < 1 or type(candidates) is not list:
+        raise ValueError("invalid_preview_input")
+    dimensions = _scoring_dimensions(task, configured_dimensions)
+    total_weight = sum(item.weight for item in dimensions)
+    qualified, rejected, review, capture_failed = [], [], [], []
+    seen = set()
+    budget = task.max_checks or default_max_checks
+    as_of = as_of or date.today()
+    for candidate in candidates:
+        if len(seen) >= budget:
+            break
+        if type(candidate) is not dict:
+            raise ValueError("invalid_candidate")
+        candidate_id, sources = candidate.get("candidate_id"), candidate.get("sources")
+        if type(candidate_id) is not str or not candidate_id.strip() or candidate_id.strip() != candidate_id:
+            raise ValueError("candidate_id_required")
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        capture_status = candidate.get("capture_status")
+        if capture_status in {"failed", "CAPTURE_FAILED"}:
+            capture_failed.append({"candidate_id": candidate_id, "capture_status": "failed",
+                                   "eligibility_status": "CAPTURE_FAILED",
+                                   "reason": candidate.get("reason", "resume_capture_failed")})
+            continue
+        if type(sources) is not dict or any(type(key) is not str or type(value) is not str for key, value in sources.items()):
+            raise ValueError("invalid_resume_sources")
+        resume = candidate.get("structured_evidence")
+        if not isinstance(resume, ResumeEvidence):
+            resume = extract_resume_evidence(sources, as_of=as_of, candidate_id=candidate_id,
+                                             capture_status=capture_status or "unverified")
+        else:
+            resume = replace(resume, as_of=as_of)
+        model_findings = candidate.get("model_findings")
+        if model_findings is None:
+            resume = scope_education_evidence(resume, task.hard_filters)
+        findings = [evaluate_condition(rule, resume, judge, model_findings=model_findings) for rule in task.hard_filters]
+        status = combine_status("AND", [finding.status for finding in findings])
+        preferences = [evaluate_condition(rule, resume, judge, model_findings=model_findings)
+                       for rule in task.soft_preferences]
+        conditions = [*findings, *preferences]
+        matched = sum(1 for item in conditions if item.status == "PASS")
+        total = len(conditions)
+        match_percent = round(100 * matched / total) if total else 100
+        supported = bool(findings) and all(_finding_has_source_support(item, sources) for item in findings)
+        unsupported_pass = status == "PASS" and bool(findings) and not supported
+        row = {"candidate_id": candidate_id, "hard_filter_status": status,
+               "eligibility_status": "UNKNOWN" if status == "PASS" and (capture_status == "partial" or unsupported_pass) else status,
+               "contact_evidence_verified": status == "PASS" and supported and capture_status != "partial",
+               "hard_filters": [finding.to_dict() for finding in findings],
+               "match_percent": match_percent, "matched_conditions": matched, "total_conditions": total,
+               "score": None, "score_breakdown": {}}
+        if "capture_status" in candidate:
+            row["capture_status"] = candidate["capture_status"]
+            row["capture_warnings"] = candidate.get("capture_warnings", [])
+        if model_findings is not None:
+            for dimension in dimensions:
+                finding = evaluate_condition(dimension.condition, resume, judge, model_findings=model_findings)
+                row["score_breakdown"][dimension.name] = {
+                    "finding": finding.to_dict(),
+                    "points": round(100 * dimension.weight / total_weight, 2) if finding.status == "PASS" else 0,
+                }
+        if status == "FAIL":
+            rejected.append(row)
+        elif status == "UNKNOWN" or capture_status == "partial" or unsupported_pass:
+            if candidate.get("capture_status") == "partial":
+                row["review_reason"] = "capture_incomplete"
+            elif unsupported_pass:
+                row["review_reason"] = "hard_condition_citation_unverified"
+            review.append(row)
+        else:
+            earned_weight = 0
+            for dimension in dimensions:
+                if model_findings is not None:
+                    if row["score_breakdown"][dimension.name]["finding"]["status"] == "PASS":
+                        earned_weight += dimension.weight
+                    continue
+                finding = evaluate_condition(dimension.condition, resume, judge)
+                earned = dimension.weight if finding.status == "PASS" else 0
+                earned_weight += earned
+                row["score_breakdown"][dimension.name] = {
+                    "points": round(100 * earned / total_weight, 2),
+                    "finding": finding.to_dict(),
+                }
+            row["score"] = round(100 * earned_weight / total_weight, 2) if total_weight else 0
+            qualified.append(row)
+    qualified.sort(key=lambda row: (-row["score"], row["candidate_id"]))
+    return {
+        "task": task.to_dict(),
+        "strict_all_conditions": False,
+        "template": template,
+        "execution_mode": "dry_run",
+        "as_of": as_of.isoformat(),
+        "summary": {
+            "checked": len(seen), "qualified": len(qualified), "unqualified": len(rejected),
+            "needs_review": len(review), "target_contact_count": task.target_success_count,
+        },
+        "ranked_candidates": qualified,
+        "rejected_candidates": rejected,
+        "review_candidates": review,
+        "capture_failed_candidates": capture_failed,
+        "contact_preview": [row["candidate_id"] for row in qualified if row["contact_evidence_verified"]][:task.target_success_count]
+        if task.action == "greet" else [],
+    }

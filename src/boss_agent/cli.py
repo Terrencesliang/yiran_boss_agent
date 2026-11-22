@@ -6,20 +6,32 @@ import json
 import re
 import time
 import random
+from dataclasses import replace
+from hashlib import sha256
+from functools import partial
 from datetime import date
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from boss_agent import __version__
+from boss_agent.contact_policy import blocked_contact
+from boss_agent.task_parser import RECRUITMENT_PARSER_POLICY, parse_recruitment_task
+from boss_agent.task_planner import plan_recruitment_task
+from boss_agent.task_validator import SENSITIVE
+from boss_agent.task_execution_audit import TaskExecutionAudit
 from boss_agent.capability_agent import analyze_operations_capability
 from boss_agent.chrome_debug import ChromeDebugClient
 from boss_agent.chrome_debug import build_chrome_launch_command
 from boss_agent.chrome_debug import classify_page
 from boss_agent.chrome_debug import launch_chrome
 from boss_agent.drafting import draft_reply
-from boss_agent.recommendation import score_recommendation
-from boss_agent.resume_agent import analyze_resume_against_criteria
+from boss_agent.job_profile import load_job_profile
+from boss_agent.recommendation import prepare_recruitment_preview, rank_recruitment_preview, score_recommendation
+from boss_agent.recommend_preview import load_preview_task, profile_fingerprint, run_recommend_preview
+from boss_agent.recommend_contact import run_recruitment_contacts
+from boss_agent.resume_agent import analyze_resume_against_criteria, judge_project_evidence
 from boss_agent.scoring import score_conversation
 from boss_agent.knowledge_base import answer_question_from_knowledge_detailed
 from boss_agent.knowledge_base import load_knowledge_base
@@ -32,6 +44,26 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("health")
+    plan_parser = subparsers.add_parser("plan-recruitment")
+    plan_parser.add_argument("--request", required=True)
+    plan_parser.add_argument("--job-context", help="Explicit current job when absent from the request")
+    preview_parser = subparsers.add_parser("evaluate-recruitment", help="Preview local candidate evidence")
+    preview_parser.add_argument("--request", required=True)
+    preview_parser.add_argument("--candidates", required=True, help="Local candidate JSON file")
+    preview_parser.add_argument("--job-context", help="Explicit current job when absent from the request")
+    preview_parser.add_argument("--sample-kind", choices=("unclassified", "synthetic", "real-deidentified"),
+                                default="unclassified", help="Provenance of offline candidate evidence")
+    preview_parser.add_argument("--job-profile", help="Local JobProfile JSON file")
+    preview_parser.add_argument("--template", help="Named template inside the job profile")
+    preview_parser.add_argument("--use-llm", action="store_true", help="Enable model-assisted semantic evidence review")
+    contact_parser = subparsers.add_parser("contact-recruitment", help="Contact an explicit qualified preview shortlist")
+    contact_parser.add_argument("--preview-report", required=True)
+    contact_parser.add_argument("--candidate-id", action="append", required=True)
+    contact_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
+    contact_parser.add_argument("--state-file", default="reports/recommend_contact_state.json")
+    contact_parser.add_argument("--send", action="store_true")
+    contact_parser.add_argument("--use-llm", action="store_true")
+    contact_parser.add_argument("--mock-dir")
     capture_parser = subparsers.add_parser("capture")
     capture_subparsers = capture_parser.add_subparsers(dest="capture_command", required=True)
     score_parser = subparsers.add_parser("score")
@@ -266,6 +298,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     detail_greet_parser = action_subparsers.add_parser("screen-recommend-detail")
     detail_greet_parser.add_argument("--config")
+    structured = detail_greet_parser.add_mutually_exclusive_group()
+    structured.add_argument("--request", help="Natural-language request for a structured preview")
+    structured.add_argument("--task-file", help="RecruitmentTask JSON or plan-recruitment output")
+    detail_greet_parser.add_argument("--job-context", help="Explicit current job for --request")
+    detail_greet_parser.add_argument("--job-profile", help="Explicit job profile JSON for structured preview")
+    detail_greet_parser.add_argument("--template", help="Named template in the explicit job profile")
+    detail_greet_parser.add_argument("--allow-live-preview", action="store_true")
+    detail_greet_parser.add_argument("--max-scrolls", type=int)
+    detail_greet_parser.add_argument("--no-new-viewports", type=int)
+    detail_greet_parser.add_argument("--use-llm", action="store_true")
     detail_greet_parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
     detail_greet_parser.add_argument("--mock-dir")
     detail_greet_parser.add_argument("--url-contains", default="/web/chat/recommend")
@@ -334,6 +376,51 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "contact-recruitment":
+        try:
+            report = json.loads(Path(args.preview_report).read_text(encoding="utf-8-sig"))
+            if args.use_llm:
+                load_local_llm_env(override=True)
+            client = ChromeDebugClient(args.endpoint, mock_dir=Path(args.mock_dir) if args.mock_dir else None)
+            result = run_recruitment_contacts(
+                client, report, args.candidate_id, send=args.send,
+                state_path=Path(args.state_file),
+                judge=judge_project_evidence if args.use_llm else None,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        return _print_json(result)
+
+    if args.command == "evaluate-recruitment":
+        try:
+            with TaskExecutionAudit(args.command, args.request) as audit:
+                task = _compile_audited_task(audit, args.request, job_context=args.job_context)
+                profile = load_job_profile(json.loads(Path(args.job_profile).read_text(encoding="utf-8-sig"))) if args.job_profile else None
+                execution_task, _ = prepare_recruitment_preview(task, profile, args.template)
+                audit.update(status="prepared", execution_task=execution_task.to_dict(), sample_kind=args.sample_kind,
+                             template=args.template, evidence_judge_enabled=args.use_llm)
+                candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8-sig"))
+                result = rank_recruitment_preview(
+                    task, candidates, profile=profile, template=args.template,
+                    judge=judge_project_evidence if args.use_llm else None,
+                )
+                result.update(sample_kind=args.sample_kind, audit_file=str(audit.path))
+                audit.update(status="completed", summary=result["summary"])
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        return _print_json(result)
+
+    if args.command == "plan-recruitment":
+        try:
+            with TaskExecutionAudit(args.command, args.request) as audit:
+                task = _compile_audited_task(audit, args.request, job_context=args.job_context)
+                plan = plan_recruitment_task(task)
+                audit.update(status="blocked" if plan["blockers"] else "planned",
+                             blockers=plan["blockers"], plan=plan)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        return _print_json({"request": args.request, "task": task.to_dict(), "plan": plan, "audit_file": str(audit.path)})
 
     if args.command == "health":
         return _print_json(
@@ -444,6 +531,15 @@ def main(argv: list[str] | None = None) -> int:
             return _print_json(client.fill_chat_input(draft["body"], url_contains=args.url_contains))
 
     if args.command == "action":
+        # Recommendation screening must not use non-job-related sensitive criteria.
+        recommendation_actions = {
+            "search-recommendations", "process-recommendations", "filter-recommendations",
+            "screen-and-greet-recommendations", "screen-and-greet-capability",
+        }
+        if args.action_command in recommendation_actions and not getattr(args, "mock_dir", None):
+            conditions = [getattr(args, "criteria", "") or "", *getattr(args, "filter", [])]
+            if any(SENSITIVE.search(value) for value in conditions):
+                parser.error("unsupported_sensitive_recruitment_condition")
         if args.action_command == "resume-consent":
             fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
             client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
@@ -673,6 +769,9 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         if args.action_command == "process-recommendations":
+            if args.send and not args.mock_dir:
+                _print_json(blocked_contact())
+                return 2
             fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
             client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
             result = _process_recommendations(
@@ -734,6 +833,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.action_command == "greet-recommendations":
             if not args.name:
                 parser.error("action greet-recommendations requires at least one --name")
+            if not args.mock_dir:
+                _print_json({"results": [], **blocked_contact()})
+                return 2
             fixture_dir = Path(args.mock_dir).resolve() if args.mock_dir else None
             client = ChromeDebugClient(endpoint=args.endpoint, mock_dir=fixture_dir)
             return _print_json(
@@ -753,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_scrolls=args.max_scrolls,
                     model=args.model,
                     max_greetings=args.max_greetings,
-                    dry_run=args.dry_run,
+                    dry_run=fixture_dir is None or args.dry_run,
                 )
             )
         if args.action_command == "screen-and-greet-capability":
@@ -768,12 +870,26 @@ def main(argv: list[str] | None = None) -> int:
                     max_scrolls=args.max_scrolls,
                     max_greetings=args.max_greetings,
                     report_path=report_path,
-                    dry_run=args.dry_run,
+                    dry_run=fixture_dir is None or args.dry_run,
                 )
             )
         if args.action_command == "screen-recommend-detail":
+            if args.request is not None or args.task_file is not None:
+                try:
+                    return _print_json(_run_structured_recommend_detail(args))
+                except (OSError, ValueError) as exc:
+                    parser.error(str(exc))
+            if (args.job_profile or args.template or args.job_context or args.use_llm or args.allow_live_preview
+                    or args.max_scrolls is not None or args.no_new_viewports is not None):
+                parser.error("structured_options_require_request_or_task_file")
+            load_local_llm_env(override=True)
             config = _load_screen_recommend_detail_config(args)
             fixture_dir = Path(config["mock_dir"]).resolve() if config.get("mock_dir") else None
+            if fixture_dir is None and (
+                SENSITIVE.search(config["criteria"])
+                or any(SENSITIVE.search(f"{key}={value}") for key, value in config["filters"].items())
+            ):
+                parser.error("unsupported_sensitive_recruitment_condition")
             client = ChromeDebugClient(endpoint=config["endpoint"], mock_dir=fixture_dir)
             result = _screen_recommend_detail(
                 client=client,
@@ -789,7 +905,7 @@ def main(argv: list[str] | None = None) -> int:
                 operation_delay_seconds=config["operation_delay_seconds"],
                 max_filter_retries=config["max_filter_retries"],
                 report_path=Path(config["report_path"]),
-                dry_run=config["dry_run"],
+                dry_run=fixture_dir is None or config["dry_run"],
             )
             return _print_json(result)
 
@@ -938,6 +1054,93 @@ def _prepare_reply(
         "attachmentPreview": attachment_preview,
         "resumeDownload": resume_download,
     }
+
+
+def _compile_audited_task(audit, request, *, task_file=None, job_context=None):
+    if task_file is not None:
+        if job_context is not None:
+            raise ValueError("job_context_requires_request")
+        raw = Path(task_file).read_bytes()
+        audit.update(task_file_sha256=sha256(raw).hexdigest())
+        payload = json.loads(raw.decode("utf-8-sig"))
+        audit.update(submitted_task=payload.get("task", payload) if isinstance(payload, dict) else payload)
+        original = payload.get("request") if isinstance(payload, dict) else None
+        if isinstance(original, str):
+            audit.update(request=original)
+        task = load_preview_task(payload)
+        audit.update(parsed_task=task.to_dict(), job_source="explicit_task_file")
+        return task
+    parsed = parse_recruitment_task(request)
+    audit.update(parsed_task=parsed.to_dict(), parser_policy=RECRUITMENT_PARSER_POLICY, job_context=job_context,
+                 job_source="request" if parsed.job else "explicit_context" if job_context else None)
+    if job_context is not None:
+        if not job_context.strip():
+            raise ValueError("invalid_job_context")
+        if parsed.job and parsed.job != job_context.strip():
+            raise ValueError("conflicting_job_context")
+        parsed = replace(parsed, job=job_context.strip())
+    return load_preview_task(parsed.to_dict())
+
+
+def _run_structured_recommend_detail(args: argparse.Namespace) -> dict[str, Any]:
+    with TaskExecutionAudit("screen-recommend-detail", args.request, args.task_file) as audit:
+        return _execute_structured_preview(args, audit)
+
+
+def _execute_structured_preview(args: argparse.Namespace, audit: TaskExecutionAudit) -> dict[str, Any]:
+    audit.update(sample_kind="simulated_browser" if args.mock_dir else "live_preview",
+                 template=args.template, evidence_judge_enabled=args.use_llm)
+    if any((args.config, args.criteria, args.job_title, args.city, args.filter, args.target_resumes,
+            args.max_greetings)):
+        raise ValueError("legacy_search_parameters_cannot_override_structured_task")
+    if not args.mock_dir and not args.allow_live_preview:
+        raise ValueError("structured_preview_requires_mock_dir_or_explicit_live_preview")
+    task = _compile_audited_task(audit, args.request, task_file=args.task_file, job_context=args.job_context)
+    profile_data = json.loads(Path(args.job_profile).read_text(encoding="utf-8-sig")) if args.job_profile else None
+    profile = load_job_profile(profile_data) if args.job_profile else None
+    prepare_recruitment_preview(task, profile, args.template)
+    version = profile_fingerprint(profile_data) if profile_data is not None else None
+    legacy_default = Path.cwd() / "reports" / "recommend_detail_greeted.xlsx"
+    report_path = Path(args.report_path)
+    if report_path == legacy_default:
+        report_path = report_path.with_name("recommend_preview.json")
+    if report_path.suffix.lower() != ".json":
+        raise ValueError("structured_preview_report_requires_json_path")
+    if args.use_llm:
+        load_local_llm_env()
+    def record_prepared(execution_task, plan, filters, budget):
+        audit.update(status="prepared", execution_task=execution_task.to_dict(), plan=plan,
+                     page_filters=filters, max_checks=budget, profile_version=version,
+                     template=args.template, sample_kind="simulated_browser" if args.mock_dir else "live_preview")
+
+    client = ChromeDebugClient(args.endpoint, mock_dir=Path(args.mock_dir).resolve() if args.mock_dir else None)
+    result = run_recommend_preview(
+        client, task, profile=profile, template=args.template, original_request=audit.record["request"],
+        profile_version=version,
+        default_max_checks=args.max_checks, url_contains=args.url_contains,
+        operation_delay=args.operation_delay_seconds or 0,
+        max_filter_retries=2 if args.max_filter_retries is None else args.max_filter_retries,
+        judge=partial(judge_project_evidence, model=args.model) if args.use_llm else None,
+        allow_live_preview=args.allow_live_preview,
+        max_scrolls=8 if args.max_scrolls is None else args.max_scrolls,
+        no_new_limit=2 if args.no_new_viewports is None else args.no_new_viewports,
+        on_prepared=record_prepared,
+    )
+    result["audit_file"] = str(audit.path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = report_path.with_name(f".{report_path.stem}.{uuid4().hex}.json")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        temporary.replace(report_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    normal_stops = {"end_of_list", "check_limit_reached", "no_new_candidates", "scroll_limit_reached"}
+    status = "completed" if result["stop_reason"] in normal_stops else "stopped"
+    audit.update(status=status, summary=result["summary"], stop_reason=result["stop_reason"],
+                 report_path=str(report_path))
+    return result
 
 
 def _load_screen_recommend_detail_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -1096,6 +1299,7 @@ def _screen_recommend_detail(
     processed: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     greeted_count = 0
+    stop_reason = ""
 
     for item in candidates_payload.get("candidates", []):
         if len(processed) >= max_checks:
@@ -1197,16 +1401,17 @@ def _screen_recommend_detail(
                         if dry_run:
                             greet_result = {"greeted": False, "dryRun": True}
                         else:
-                            greet_result = _click_recommend_card_greet_with_retries(
+                            greet_result = _click_recommend_card_greet_once(
                                 client=client,
                                 item=item,
                                 url_contains=url_contains,
-                                attempts=3,
                                 operation_delay_seconds=operation_delay_seconds,
                             )
                             operation_delay()
                             if greet_result.get("greeted"):
                                 greeted_count += 1
+                            elif greet_result.get("reason") == "send_unconfirmed":
+                                reason = stop_reason = "send_unconfirmed"
                     elif analysis.get("meetsCriteria"):
                         reason = "criteria_low_confidence"
                     else:
@@ -1256,7 +1461,7 @@ def _screen_recommend_detail(
             }
         )
 
-        if greeted_count >= max_greetings:
+        if stop_reason or greeted_count >= max_greetings:
             break
 
     report = _write_recommend_detail_report(
@@ -1279,6 +1484,7 @@ def _screen_recommend_detail(
         "checkedCount": len(processed),
         "matchedCount": len(matched),
         "greetedCount": len(greeted),
+        "stopReason": stop_reason,
         "matchedNames": [str(item.get("name") or "") for item in matched if item.get("name")],
         "greetedNames": [str(item.get("name") or "") for item in greeted if item.get("name")],
         "openRecommendPage": open_result,
@@ -1389,71 +1595,29 @@ def _recommend_candidate_dedupe_key(
     return ""
 
 
-def _click_recommend_card_greet_with_retries(
+def _click_recommend_card_greet_once(
     client: ChromeDebugClient,
     item: dict[str, Any],
     url_contains: str,
-    attempts: int = 4,
     operation_delay_seconds: float = 0,
 ) -> dict[str, Any]:
-    def operation_delay() -> None:
-        if operation_delay_seconds > 0:
-            time.sleep(operation_delay_seconds)
-
-    results: list[dict[str, Any]] = []
-    final_result: dict[str, Any] = {"greeted": False, "clicked": False, "attempts": results}
-    for attempt in range(1, max(1, attempts) + 1):
-        # Dismiss any popup cards before attempting
-        try:
-            pre_popup_dismiss = client.dismiss_recommend_popup_cards(url_contains=url_contains)
-        except Exception as exc:
-            pre_popup_dismiss = {"dismissed": False, "reason": str(exc)}
-        try:
-            close_before_greet = client.close_recommend_detail(url_contains=url_contains)
-            operation_delay()
-        except Exception as exc:
-            close_before_greet = {"closed": False, "reason": str(exc)}
-        try:
-            result = client.click_recommend_card_greet(
-                candidate_id=str(item.get("candidateId") or ""),
-                card_index=int(item.get("cardIndex") or 0),
-                url_contains=url_contains,
-            )
-            operation_delay()
-        except Exception as exc:
-            result = {"greeted": False, "clicked": False, "reason": str(exc)}
-        result = {
-            **result,
-            "attempt": attempt,
-            "method": result.get("method") or "card_greet_after_detail_close",
-            "closeBeforeGreet": close_before_greet,
-            "prePopupDismiss": pre_popup_dismiss,
-        }
-        if not result.get("greeted"):
-            try:
-                pre_detail_fallback_skip = client.dismiss_recommend_popup_cards(url_contains=url_contains)
-                time.sleep(0.3)
-                detail_fallback = client.click_recommend_detail_greet(url_contains=url_contains)
-                operation_delay()
-            except Exception as exc:
-                pre_detail_fallback_skip = {"skipped": False, "dismissed": False, "reason": str(exc)}
-                detail_fallback = {"greeted": False, "clicked": False, "reason": str(exc)}
-            result["preDetailFallbackSkipSimilarRecommend"] = pre_detail_fallback_skip
-            result["detailFallback"] = detail_fallback
-            if detail_fallback.get("greeted"):
-                result["greeted"] = True
-        results.append(result)
-        final_result = {**result, "attempts": results, "retryCount": attempt - 1}
-        if result.get("greeted"):
-            try:
-                post_greet_skip = client.dismiss_recommend_popup_cards(url_contains=url_contains)
-            except Exception as exc:
-                post_greet_skip = {"skipped": False, "dismissed": False, "reason": str(exc)}
-            final_result["postGreetSkipSimilarRecommend"] = post_greet_skip
-            result["postGreetSkipSimilarRecommend"] = post_greet_skip
-            return final_result
-        time.sleep(1.5)
-    return final_result
+    candidate_id = str(item.get("candidateId") or "").strip()
+    if not candidate_id:
+        return {"clicked": False, "greeted": False, "reason": "candidate_id_required"}
+    try:
+        result = client.click_recommend_card_greet(candidate_id=candidate_id, url_contains=url_contains)
+    except Exception:
+        # A transport error may occur after dispatch. Do not retry the action.
+        return {"clicked": None, "greeted": False, "reason": "send_unconfirmed", "candidateId": candidate_id}
+    _sleep_operation_delay(operation_delay_seconds)
+    if (result.get("clicked") or result.get("greeted")) and (
+        not result.get("clicked")
+        or result.get("candidateId") != candidate_id
+        or not result.get("greeted")
+        or (not result.get("mock") and not ChromeDebugClient._is_recommend_greeted_status(result.get("status", "")))
+    ):
+        return {**result, "greeted": False, "reason": "send_unconfirmed"}
+    return result
 
 
 def _recommend_detail_matches_local_filters(
