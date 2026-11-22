@@ -1,8 +1,16 @@
 # 招聘工作台
 
+## Windows 一键启动
+
+在仓库根目录双击 `Start-Workbench.cmd`。脚本复用已启动的工作台，或检查 Python 3.12+ 和项目虚拟环境，使用 Winget 安装缺失的 Python，补齐 Python 依赖后打开浏览器。首次安装需要联网，并可能弹出 Windows 安装授权。
+
+连接模式默认使用 8766 端口，AI 连接从仓库根目录的 `.env` 读取配置。连接 BOSS 时需要本机安装 Chrome，并在工作台「系统设置」中打开 BOSS 和登录。
+
+离线演示无需模型密钥，可以在 PowerShell 运行 `.\Start-Workbench.cmd -Demo`，默认打开 8767 端口。也支持 `-Port` 指定端口。
+
 ## 离线演示
 
-在 `D:\BOSS直聘` 启动，打开 [离线招聘工作台](http://127.0.0.1:8767/)。
+在仓库根目录启动，打开 [离线招聘工作台](http://127.0.0.1:8767/)。
 
 ```powershell
 .\.venv\Scripts\python.exe .\recruitment-workbench\server.py --demo --port 8767
