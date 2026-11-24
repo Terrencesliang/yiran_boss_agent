@@ -534,6 +534,11 @@
     background-image: linear-gradient(90deg, #5b86f9, #2f5be0);
   }
 
+  .boss-major-search { @apply mt-2 flex items-center gap-2 text-[12px] text-ink-mute; }
+  .boss-major-search input { @apply h-8 flex-1; }
+  .boss-first-degree { @apply mt-3 rounded-lg border border-line bg-[#fafbfe] px-3 py-2 text-[12.5px] font-normal text-ink-mute; }
+  .boss-first-degree[hidden] { display: none; }
+
   .form > label.auto-greet {
     display: flex; align-items: center; gap: .5rem;
     border-radius: 9px; border: 1px solid var(--line); background: #fafbfe;
@@ -571,6 +576,18 @@
   .requirement-list li + li { @apply border-t border-line; }
   .requirement-list details { @apply mt-1 text-[12px] text-ink-faint; }
   .requirement-list details ul { @apply mt-1.5 pl-4 text-ink-mute; list-style: disc; }
+  .job-policy { @apply mb-3 rounded-xl border border-line bg-[#fafbfe] px-4 py-3; }
+  .job-policy > summary { @apply cursor-pointer text-[12.5px] font-medium text-ink-mute; }
+  .policy-body { @apply mt-2 grid gap-2; }
+  .policy-mode { @apply flex flex-wrap items-center gap-2 text-[12.5px] text-ink-mute; }
+  .policy-mode select { @apply h-8 min-w-[230px]; }
+  .policy-hint { @apply text-[11.5px] text-ink-faint; }
+  .policy-weighted { @apply flex flex-wrap items-center gap-3 text-[12px] text-ink-mute; }
+  .policy-weighted[hidden] { display: none; }
+  .policy-weighted input { @apply h-8 w-[68px] text-center; }
+  .policy-actions { @apply mt-1 flex items-center gap-2; }
+  #policy-status { @apply text-[11.5px] text-ok-700; }
+
   .plan-actions {
     @apply mt-4 flex flex-wrap items-center gap-3 rounded-xl border border-line bg-[#fafbfe] px-4 py-3;
   }
@@ -822,6 +839,32 @@
 #review-body .candidate-heading h3 { margin:0; font-size:.9rem; }
 #review-body .candidate-result > p { grid-column:1; margin:0; font-size:.94rem; line-height:1.6; }
 #review-body .candidate-actions { grid-area:1/2/span 2; align-self:center; display:flex; flex-wrap:wrap; gap:.5rem; }
+#review-body .candidate-reasons { margin: 0 0 16px; }
+#review-body .proof-text h4 { @apply mt-3 mb-1 text-[13px] font-semibold text-ink; }
+#review-body .proof-text h4:first-child { @apply mt-0; }
+#review-body .proof-text p { @apply my-1 leading-7; }
+#review-body .proof-text ul { @apply my-1 list-disc pl-5; }
+#review-body .proof-text li { @apply my-0.5 leading-7; }
+
+#review-body .reason-brief {
+  margin: .2rem 0 .55rem; padding: .55rem .7rem; border-radius: 8px;
+  background: #f4f7fc; color: #2f4664; font-size: .84rem; line-height: 1.6;
+}
+
+#review-body .warn { @apply rounded bg-[#fdf1e8] px-1.5 py-0.5 text-[11px] text-[#934415]; }
+
+#review-body .reason-list { display: grid; gap: .45rem; margin: .55rem 0 0; padding: 0; list-style: none; }
+#review-body .reason-line {
+  display: grid; grid-template-columns: 1.1rem auto minmax(0, 1fr); gap: .5rem;
+  font-size: .86rem; line-height: 1.55; align-items: baseline;
+}
+#review-body .reason-icon { font-weight: 700; text-align: center; }
+#review-body .reason-line.is-pass .reason-icon { color: #127a52; }
+#review-body .reason-line.is-fail .reason-icon { color: #c33a54; }
+#review-body .reason-line.is-unknown .reason-icon { color: #9a6a12; }
+#review-body .reason-line b { font-weight: 600; }
+#review-body .reason-line span:last-child { color: #4a5b75; }
+
 #review-body .candidate-layout { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:16px; }
 #review-body .candidate-main, #review-body .candidate-side { display:grid; align-content:start; gap:16px; min-width:0; }
 #review-body .candidate-card {

@@ -470,15 +470,26 @@ function timelinePanel(data,evidence,fragments) {
       '<p class="muted">未取得工作经历正文。</p>');
 }
 const expectedLabels={full_time:"全日制",part_time:"非全日制",secondary:"中专",bachelor:"本科",associate:"大专",master:"硕士",doctorate:"博士"};
+const extraFieldNames={job_related_requirement:"岗位相关要求",job_related_preference:"加分项",
+  resume_keywords:"关键词",industry_experience:"行业经验",experience_months:"相关经验"};
+function cleanValue(value) {
+  return String(value ?? "").replace(/^[:：]\s*/,"").replace(/\s+/g," ").trim();
+}
 function candidateRequirement(item,rule) {
   if(item.children?.length) {
     const joiner=item.field==="OR"?" 或 ":"，且 ";
     return item.children.map((child,index)=>candidateRequirement(child,rule?.conditions?.[index])).join(joiner);
   }
-  const name=fields[item.field] || item.field;
+  const rawField=String(item.field || "");
+  const [base,detail]=rawField.split(":");
+  const baseName=extraFieldNames[base] || fields[base] || conditionNames[base] || base;
+  const name=detail?baseName+"（"+detail+"）":baseName;
   const value=item.expected ?? rule?.value;
   const labels=Array.isArray(value)?value:[value];
-  const expected=labels.map(value=>expectedLabels[value] || reviewDisplay(value));
+  const expected=labels.map(value=>expectedLabels[cleanValue(value)] || reviewDisplay(cleanValue(value)));
+  if(base==="experience_months")return name+"："+expected.join("、")+" 个月";
+  if(["job_related_requirement","job_related_preference","resume_keywords"].includes(base))
+    return name+"："+expected.join("、");
   if(rule?.operator==="between" && item.field==="hr_experience_months" && value?.[0]===0)
     return "人力资源工作时长不超过 "+value[1]+" 个月";
   const operator={gt:"超过 ",gte:"至少 ",lte:"最多 "}[rule?.operator] || "";
@@ -497,17 +508,68 @@ function resumeFragment(ref,withTarget) {
     escape(sourceLabel(ref.source_type)+" · "+offsets(ref))+'</small></div>'+
     (ref.uses.length?'<span class="proof-chip">用于 '+escape(ref.uses.join("、"))+'</span>':'')+'</article>';
 }
+const resumeSections=/^(工作经历|项目经历|项目经验|实习经历|教育经历|教育背景|专业技能|技能特长|自我评价|个人优势|求职意向|期望职位|基本信息|最近关注|工作经历)/;
+function formatResumeHtml(text) {
+  const lines=String(text || "").split("\n").map(line=>line.trim()).filter(Boolean);
+  const html=[];
+  let bullets=[];
+  const flush=()=>{
+    if(bullets.length) {
+      html.push('<ul>'+bullets.map(item=>'<li>'+escape(item)+'</li>').join("")+'</ul>');
+      bullets=[];
+    }
+  };
+  for(const line of lines) {
+    const section=line.match(resumeSections);
+    if(section) {
+      flush();
+      const rest=line.slice(section[1].length).replace(/^[:：\s]+/,"");
+      html.push('<h4>'+escape(section[1])+'</h4>');
+      if(rest)html.push('<p>'+escape(rest)+'</p>');
+      continue;
+    }
+    const bullet=line.replace(/^[·•\-*]\s*/,"").replace(/^\d+[.、)]\s*/,"").replace(/^（\d+）/,"");
+    if(bullet!==line) { bullets.push(bullet); continue; }
+    if(line.length>60 && /[；;]/.test(line)) {
+      flush();
+      const parts=line.split(/[；;]/).map(item=>item.trim()).filter(Boolean);
+      html.push('<ul>'+parts.map(item=>'<li>'+escape(item)+'</li>').join("")+'</ul>');
+      continue;
+    }
+    flush();
+    html.push('<p>'+escape(line)+'</p>');
+  }
+  flush();
+  return html.join("");
+}
+function cleanResumeText(text) {
+  return String(text || "").split("\n").map(line=>line.trim())
+    .filter(line=>line && !/^(收藏|转发|举报|不合适|打招呼|更多|关闭|返回|分享|复制|下载|查看|收起|展开|在线简历|附件简历|沟通|交换微信|求简历)$/.test(line))
+    .join("\n");
+}
+function ocrLooksBad(text) {
+  const value=String(text || "");
+  const cjk=(value.match(/[\u4e00-\u9fff]/g) || []).length;
+  return value.length>40 && cjk/Math.max(1,value.length)<0.2;
+}
 function resumePanel(row,fragments) {
   const sources=Object.entries(row.resume_sources || {}).filter(([,text])=>text.trim());
   const groups=[...new Set(["OCR","DOM",...fragments.map(ref=>ref.source_type)])];
-  return '<div class="proof-panel-head"><h3>简历正文</h3><div class="proof-actions">'+
+  return '<div class="proof-panel-head"><h3>简历内容</h3><div class="proof-actions">'+
     (sources.length || fragments.length?'<button class="button" type="button" data-resume-open>查看原文</button>':'')+
     (sources.length?'<button class="button" type="button" data-resume-download>下载简历文本</button>':'')+'</div></div>'+
     (sources.length?
       (row.candidate_evidence.capture_status==="partial"?'<p class="muted">本次采集不完整，以下为已取得的正文。</p>':'')+
-      sources.map(([source,text],index)=>'<details class="proof-disclosure"'+(index===0?' open':'')+'><summary>'+
-        escape(sourceLabel(source.toUpperCase()))+'</summary><p class="proof-text">'+
-        escape(text.replace(/█+/g,"［已隐藏］"))+'</p></details>').join(""):
+      '<p class="muted">页面摘要来自 BOSS 详情页可见内容（已去掉按钮文字）；附件识别来自简历图片，质量以标注为准。</p>'+
+      sources.map(([source,text],index)=>{
+        const kind=source.toUpperCase();
+        const display=kind==="DOM"?cleanResumeText(text):text;
+        const bad=kind==="OCR" && ocrLooksBad(display);
+        return '<details class="proof-disclosure"'+(index===0?' open':'')+'><summary>'+
+          escape(sourceLabel(kind))+(bad?' <small class="warn">识别质量较差，仅供参考</small>':"")+
+          ' <small>（'+String(display).length+' 字）</small></summary><div class="proof-text">'+
+          formatResumeHtml(display.replace(/█+/g,"［已隐藏］"))+'</div></details>';
+      }).join(""):
       '<p class="muted">'+(fragments.length?"此批次仅保存了用于筛选和复核的原文片段。":"此批次没有可显示的简历正文。")+'</p>')+
     (fragments.length?'<details class="proof-disclosure" id="candidate-section-evidence"'+(sources.length?'':' open')+
       '><summary>查看已保存的简历片段 <small>（'+fragments.length+' 段 · 已去重）</small></summary>'+
@@ -518,6 +580,43 @@ function resumePanel(row,fragments) {
           ' 段）</small></summary>'+(refs.length?refs.map(ref=>resumeFragment(ref,true)).join(""):'<p class="muted">本批次无此来源的引用片段。</p>')+'</details>';
       }).join("")+'</div><div data-proof-pane="offset" hidden>'+fragments.map(ref=>resumeFragment(ref,false)).join("")+
       '</div></details>':'');
+}
+function reasonLines(row) {
+  const items=[...(row.official_criteria || []),...(row.preference_criteria || [])];
+  if(!items.length)return "";
+  const buckets={PASS:[],FAIL:[],UNKNOWN:[]};
+  const lines=items.map(item=>{
+    const status=item.status || "UNKNOWN";
+    const icon=status==="PASS"?"✓":status==="FAIL"?"✗":"?";
+    const label=candidateRequirement(item);
+    const short=label.split("：").pop();
+    (buckets[status] || buckets.UNKNOWN).push(short);
+    const quotes=(item.evidence_ids || []).map(id=>row.evidence?.[id]?.quote).filter(Boolean)
+      .map(text=>String(text).replace(/\s+/g," ").slice(0,160));
+    let detail=String(item.reason || "").trim();
+    const generic=!detail || /三值|求值|子条件|按子条件/.test(detail);
+    if(generic)detail=status==="PASS"?"简历原文可支持该条件":"简历中未找到可核对的相关描述";
+    if(status==="PASS" && quotes.length)detail=detail+"　原文："+quotes[0];
+    const tail=status==="PASS"?"，满足要求。":status==="FAIL"?"，不符合。":"，待人工确认。";
+    return '<li class="reason-line is-'+status.toLowerCase()+'"><span class="reason-icon">'+icon+
+      '</span><b>'+escape(label)+'</b><span>'+escape(detail+tail)+'</span></li>';
+  }).join("");
+  const brief=[
+    buckets.PASS.length?"已满足："+buckets.PASS.slice(0,6).join("、"):"",
+    buckets.FAIL.length?"不符合："+buckets.FAIL.slice(0,4).join("、"):"",
+    buckets.UNKNOWN.length?"待核实："+buckets.UNKNOWN.slice(0,6).join("、"):""
+  ].filter(Boolean).join("；");
+  return '<section class="candidate-card candidate-reasons"><h3>筛选依据</h3>'+
+    (brief?'<p class="reason-brief">'+escape(brief)+'</p>':'')+
+    '<p class="muted">逐条对照简历原文：勾选表示有原文支持，叉号表示明确不符，问号表示简历里找不到可核对的内容。</p>'+
+    '<ul class="reason-list">'+lines+'</ul></section>';
+}
+function policyText(row) {
+  const mode=row.decision_mode;
+  if(mode==="strict_core")return "本次判定：核心要求需全部满足，加分项只影响排序。";
+  if(mode==="weighted")return "本次判定：核心满足 ≥"+(row.min_core_percent ?? 100)+"% 且加分项 ≥"+(row.min_bonus_count ?? 0)+" 项。";
+  if(mode==="strict_all")return "本次判定：全部条件（核心+加分）满足才算符合。";
+  return "此运行按旧口径判定（优先条件仅计分）；匹配度为按现有条件补算。";
 }
 function verdictText(row) {
   if(row.strict_all_conditions && row.hard_filter_status==="PASS" && row.official_status!=="PASS")
@@ -544,15 +643,15 @@ function renderReviewDetail() {
     '<p>'+escape(screeningReasons(row).join("；") || verdictText(row))+'</p>'+
     '<div class="candidate-actions"><button class="button is-primary" type="button" data-candidate-section="resume">查看简历</button>'+
     '<button class="button" type="button" data-candidate-section="review">人工复核</button></div></section>'+
+    reasonLines(row)+
     '<div class="candidate-layout"><div class="candidate-main">'+
     '<section class="candidate-card candidate-education">'+educationPanel(raw,evidence,row,educationHistory)+'</section>'+
     '</div><div class="candidate-side">'+
     (row.official_criteria.length || row.preference_criteria?.length?
       '<section class="candidate-card candidate-match"><h3>岗位要求与匹配情况</h3>'+
-      '<p class="muted candidate-rule">'+(row.strict_all_conditions?"该历史批次按 100% 匹配判定。":
-        "硬性要求决定是否符合，优先条件用于排序。匹配度包含两类条件。")+'</p>'+
+      '<p class="muted candidate-rule">'+escape(policyText(row))+'</p>'+
       candidateChecks(row.official_criteria,task.hard_filters)+
-      (row.preference_criteria?.length?'<h4>优先条件</h4>'+candidateChecks(row.preference_criteria):'')+'</section>':'')+
+      (row.preference_criteria?.length?'<h4>加分项</h4>'+candidateChecks(row.preference_criteria):'')+'</section>':'')+
     '</div></div><div class="candidate-proof-grid"><section class="candidate-card candidate-experience">'+timelinePanel(raw,evidence,fragments)+
     '</section><section class="candidate-card" id="candidate-section-resume" tabindex="-1">'+resumePanel(row,fragments)+'</section></div>'+
     '<div class="candidate-proof-grid">'+
@@ -570,7 +669,7 @@ function renderReviewDetail() {
       '<p class="subtitle">暂无复核记录</p>')+'</section>'+
     '<details class="candidate-card" id="candidate-section-technical"><summary>查看详细判定记录</summary>'+
     '<h4>筛选条件</h4>'+reviewCriteria(row.official_criteria,evidence)+
-    (row.preference_criteria?.length?'<h4>优先条件</h4>'+reviewCriteria(row.preference_criteria,evidence):'')+
+    (row.preference_criteria?.length?'<h4>加分项</h4>'+reviewCriteria(row.preference_criteria,evidence):'')+
     (row.shadow?'<h4>辅助分析 '+pill(row.shadow.status)+'</h4>'+reviewCriteria(row.shadow.criteria || [],evidence):'')+
     (row.capture_reason?'<p>'+escape(row.capture_reason)+'</p>':'')+
     '<details><summary>运行记录与工作时长计算</summary><p>'+escape(row.candidate_id)+'</p><pre class="response">'+

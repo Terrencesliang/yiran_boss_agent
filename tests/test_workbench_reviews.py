@@ -11,6 +11,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# 仓库根有时会被移到上一级（recruitment-workbench 与 phase5-evidence 同级）
+if not (ROOT / "phase5-evidence").exists() and (ROOT.parent / "phase5-evidence").exists():
+    ROOT = ROOT.parent
 RUN = "a1b2c3d4e5f6"
 TOKEN = "a" * 32
 OWNER = sha256(TOKEN.encode()).hexdigest()

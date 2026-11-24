@@ -40,6 +40,15 @@ def load_preview_task(payload: object) -> RecruitmentTask:
         raise ValueError("invalid_job")
     if data["action"] not in ("screen", "greet"):
         raise ValueError("invalid_action")
+    reference = data.get("reference_conditions", [])
+    if type(reference) is not list or any(type(item) is not str or not item.strip() for item in reference):
+        raise ValueError("invalid_reference_conditions")
+    if data.get("decision_mode", "strict_all") not in ("strict_all", "strict_core", "weighted"):
+        raise ValueError("invalid_decision_mode")
+    for field, low, high in (("min_core_percent", 0, 100), ("min_bonus_count", 0, 50)):
+        value = data.get(field, 0)
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"invalid_{field}")
     for field in ("max_checks", "target_success_count"):
         value = data[field]
         if value is not None and (type(value) is not int or value < 1):

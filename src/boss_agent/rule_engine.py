@@ -286,6 +286,14 @@ def _hr_duration(rule: Criterion, resume: ResumeEvidence) -> Finding | None:
 
 
 def _deterministic(rule: Criterion, resume: ResumeEvidence) -> Finding:
+    if rule.field == "resume_keywords":
+        # 关键词匹配：用于「做过 RAG 项目」这类没有结构化字段的要求
+        corpus = "\n".join(str(text or "") for text in (resume.sources or {}).values()).lower()
+        keywords = [str(item) for item in (rule.value if isinstance(rule.value, list) else [rule.value]) if str(item).strip()]
+        hits = [item for item in keywords if item.lower() in corpus]
+        reason = (f"简历出现关键词：{'、'.join(hits)}" if hits
+                  else f"简历未出现关键词：{'、'.join(keywords)}")
+        return Finding(rule.field, rule.value, "PASS" if hits else "FAIL", reason, [])
     duration = _work_duration(rule, resume)
     if duration is not None:
         return duration

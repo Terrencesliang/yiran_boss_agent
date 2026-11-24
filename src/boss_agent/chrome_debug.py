@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from uuid import uuid4
 from websocket import create_connection
 
@@ -2380,7 +2381,7 @@ class ChromeDebugClient:
         if isinstance(value, (list, tuple, set)):
             raw_items = [str(item) for item in value]
         else:
-            raw_items = re.split(r"[,，、;；|/]|(?:\s+or\s+)|或", str(value or ""), flags=re.IGNORECASE)
+            raw_items = re.split(r"[,，、;；|]|(?:\s+or\s+)|或", str(value or ""), flags=re.IGNORECASE)
         return [item.strip() for item in raw_items if item.strip()]
 
     @staticmethod
@@ -4141,6 +4142,7 @@ class ChromeDebugClient:
         }
 
     def _capture_recommend_canvas_ocr(self, websocket_url: str) -> dict[str, Any]:
+        self._vision_budget = 8
         tesseract = self._find_tesseract()
         if not tesseract:
             return {"status": "ocr_tesseract_not_found"}
@@ -4188,6 +4190,7 @@ class ChromeDebugClient:
         return fallback
 
     def _capture_recommend_canvas_ocr_single(self, websocket_url: str, tesseract: str | None = None) -> dict[str, Any]:
+        self._vision_budget = 2
         try:
             canvas = self._evaluate_json(websocket_url, build_capture_recommend_canvas_data_url_expression(), timeout=10)
         except Exception as exc:
@@ -4205,6 +4208,22 @@ class ChromeDebugClient:
             return {"status": "ocr_tesseract_not_found"}
 
         result = self._ocr_canvas_data_url_segment(canvas, tesseract=tesseract)
+        text = str(result.get("text") or "")
+        if result.get("status") != "ok" or not text or "空白" in text[:12]:
+            shot = self._capture_page_screenshot(websocket_url)
+            vision = self._model_transcribe_image(shot, (
+                "这是一张招聘网站的截图。只转写右侧候选人简历面板里的文字（经历、公司、职位、时间、学校、专业、技能），"
+                "忽略左侧列表、顶部导航和按钮文字；按原顺序分段，不要总结。")) if shot else ""
+            if vision:
+                return {
+                    "status": "ok",
+                    "text": vision,
+                    "sections": self._extract_ocr_sections(vision),
+                    "stderr": "",
+                    "vision": True,
+                    "canvas": {key: canvas.get(key) for key in ("width", "height", "cssWidth", "cssHeight")},
+                    "resumeSource": "detail+screenshot_vision",
+                }
         if result.get("status") != "ok":
             return {
                 **result,
@@ -4221,11 +4240,62 @@ class ChromeDebugClient:
             "resumeSource": "detail+canvas_ocr",
         }
 
+    def _capture_page_screenshot(self, websocket_url: str, scale: float = 2) -> str:
+        ws = create_connection(websocket_url, timeout=60)
+        try:
+            response = self._send_cdp_command(ws, method="Page.captureScreenshot",
+                                              params={"format": "png", "captureBeyondViewport": False,
+                                                      "clip": {"x": 0, "y": 0, "width": 1440, "height": 900, "scale": scale}})
+        finally:
+            ws.close()
+        data = (response.get("result") or {}).get("data") or ""
+        return "data:image/png;base64," + data if data else ""
+
+    def _model_transcribe_image(self, data_url: str, prompt: str | None = None) -> str:
+        """优先用多模态模型转写简历图片；失败或超额时返回空串，交给 Tesseract。"""
+        if getattr(self, "_vision_budget", 0) <= 0:
+            return ""
+        model = os.environ.get("BOSS_AGENT_LLM_MODEL")
+        base = (os.environ.get("BOSS_AGENT_LLM_BASE_URL") or "").rstrip("/")
+        key = os.environ.get("BOSS_AGENT_LLM_API_KEY") or ""
+        if not (model and base and key):
+            return ""
+        payload = {
+            "model": model, "temperature": 0, "max_tokens": 2000,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt or ("逐字转写这张简历图片中的全部文字：按原顺序分段，保留公司、职位、时间、学校、专业等，"
+                                                    "不要总结，不要补充图片里没有的内容。只输出转写文本。")},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}],
+        }
+        if (base + "/").startswith("https://api.deepseek.com/"):
+            payload["thinking"] = {"type": "disabled"}
+        self._vision_budget = getattr(self, "_vision_budget", 0) - 1
+        try:
+            request = Request(base + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
+                              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                              method="POST")
+            with urlopen(request, timeout=45) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            return str(body["choices"][0]["message"].get("content") or "").strip()
+        except Exception:
+            return ""
+
     def _ocr_canvas_data_url_segment(self, canvas: dict[str, Any], tesseract: str) -> dict[str, Any]:
         data_url = str(canvas.get("dataUrl") or "")
         if "," not in data_url:
             return {
                 "status": "ocr_canvas_empty",
+                "scrollTop": canvas.get("scrollTop"),
+                "canvas": {key: canvas.get(key) for key in ("width", "height", "cssWidth", "cssHeight")},
+            }
+        vision_text = self._model_transcribe_image(data_url)
+        if vision_text:
+            return {
+                "status": "ok",
+                "text": vision_text,
+                "stderr": "",
+                "vision": True,
                 "scrollTop": canvas.get("scrollTop"),
                 "canvas": {key: canvas.get(key) for key in ("width", "height", "cssWidth", "cssHeight")},
             }
@@ -5393,22 +5463,44 @@ def build_apply_recommend_filters_expression(
       }});
     return candidates[0] || null;
   }};
-  const prepareMajorOptions = async values => {{
+  const openMajorPopup = async () => {{
     const group = strictGroup('专业');
-    if (!group || values.every(value => findOption(group, value, true))) return;
+    if (!group) return null;
+    if (isVisible(group.querySelector('.options .option'))) return group;
+    const opener = group.querySelector('.check-box.major .option') || group.querySelector('.check-box.major');
+    if (!opener) return group;
+    clickElement(opener);
+    await waitAfterOptionClick();
+    return group;
+  }};
+  const dialogVisible = () => visibleNodes('.filter-subject-dialog').find(
+    (el) => !String(el.className || '').includes('subject-leave'));
+  const prepareMajorOptions = async values => {{
+    const group = await openMajorPopup();
+    if (!group) return;
+    if (values.every(value => findOption(group, value, true))) return;
     const trigger = group.querySelector('.operate-btn.major');
     if (!isVisible(trigger) || !values.every(value => Object.hasOwn(majorCategories,value))) return;
     trigger.click();
-    await delay(300);
-    const dialog = visibleNodes('.filter-subject-dialog')[0];
+    let dialog = null;
+    for (let attempt = 0; attempt < 16 && !dialog; attempt += 1) {{
+      await delay(150);
+      dialog = dialogVisible();
+    }}
     if (!dialog) return;
     const footerButton = label => Array.from(dialog.querySelectorAll('.major-footer-btns button'))
       .find(button => text(button) === label && isVisible(button) && !button.disabled);
     const selected = () => Array.from(dialog.querySelectorAll('.major-select-item'));
     let saved = false;
     try {{
-      for (const item of selected()) {{
-        if (!values.includes(text(item))) item.querySelector('.iboss-close')?.click();
+      // 先补齐目标专业，再删多余的：BOSS 至少保留 1 项，删空会失败
+      for (let guard = 0; guard < 6; guard += 1) {{
+        const missing = values.filter(value => !selected().some(item => text(item) === value));
+        if (!missing.length || selected().length + missing.length <= 5) break;
+        const extra = selected().find(item => !values.includes(text(item)));
+        if (!extra) break;
+        extra.querySelector('.iboss-close')?.click();
+        await delay(200);
       }}
       for (const value of values) {{
         if (selected().some(item => text(item) === value)) continue;
@@ -5416,20 +5508,35 @@ def build_apply_recommend_filters_expression(
           .find(item => text(item) === majorCategories[value]);
         if (!isVisible(category)) return;
         category.click();
-        await delay(100);
-        const option = Array.from(dialog.querySelectorAll('.filter-major-names > div'))
-          .find(item => text(item) === value);
+        let option = null;
+        for (let attempt = 0; attempt < 10 && !option; attempt += 1) {{
+          await delay(100);
+          option = Array.from(dialog.querySelectorAll('.filter-major-names > div'))
+            .find(item => text(item) === value);
+        }}
         if (!isVisible(option)) return;
         option.click();
+        for (let attempt = 0; attempt < 8 && !selected().some(item => text(item) === value); attempt += 1) {{
+          await delay(120);
+        }}
+      }}
+      for (let guard = 0; guard < 8; guard += 1) {{
+        const extra = selected().filter(item => !values.includes(text(item)));
+        if (!extra.length) break;
+        extra[0].querySelector('.iboss-close')?.click();
+        await delay(200);
       }}
       const picked = selected().map(text);
       const confirm = footerButton('确定');
       if (picked.length !== values.length || !values.every(value => picked.includes(value)) || !confirm) return;
       confirm.click();
-      await delay(350);
-      saved = !isVisible(dialog);
+      for (let attempt = 0; attempt < 12 && dialogVisible(); attempt += 1) {{
+        await delay(150);
+      }}
+      saved = !dialogVisible();
     }} finally {{
-      if (!saved && isVisible(dialog)) footerButton('取消')?.click();
+      if (!saved && dialogVisible()) footerButton('取消')?.click();
+      await openMajorPopup();
     }}
   }};
   const clickOptionAndReadSelected = async (scope, value, strict = false) => {{
@@ -5842,6 +5949,33 @@ def build_apply_recommend_filters_expression(
       panelClosed: !rootDocument.querySelector('.filter-panel')
     }};
   }};
+  const isFirstDegreeKey = (key) => String(key || '').trim() === '只看第一学历';
+  const firstDegreeWrap = () => {{
+    const group = strictGroup('院校') || filterGroup('院校');
+    const panel = rootDocument.querySelector('.filter-panel') || rootDocument;
+    return (group && group.querySelector('.first-degree-wrap')) || panel.querySelector('.first-degree-wrap');
+  }};
+  const clearFirstDegreeFilter = async () => {{
+    const wrap = firstDegreeWrap();
+    if (!wrap) return {{ cleared: false, reason: 'first_degree_toggle_missing' }};
+    const box = wrap.querySelector('.check-box') || wrap;
+    if (!String(box.className || '').includes('checked')) return {{ cleared: false, reason: 'already_unchecked' }};
+    clickElement(box);
+    await waitAfterOptionClick();
+    return {{ cleared: !String(box.className || '').includes('checked'), checked: String(box.className || '').includes('checked') }};
+  }};
+  const applyFirstDegreeFilter = async () => {{
+    const wrap = firstDegreeWrap();
+    if (!wrap) return {{ applied: false, checked: false, reason: 'first_degree_toggle_missing' }};
+    const box = wrap.querySelector('.check-box') || wrap;
+    const readChecked = () => String(box.className || '').includes('checked');
+    if (!readChecked()) {{
+      clickElement(box);
+      await waitAfterOptionClick();
+    }}
+    const checked = readChecked();
+    return {{ applied: checked, checked, method: 'checkbox' }};
+  }};
   const valueVerified = (key, value, result, echo) => {{
     if (!result?.applied) return false;
     if (isAgeFilterKey(key)) {{
@@ -5879,6 +6013,7 @@ def build_apply_recommend_filters_expression(
   const panelScanBefore = filterEntries.length > 0 ? scanPanelCapabilities() : {{ panelOpen: false, groups: [], pageTags: [] }};
   for (const [key, value] of Object.entries(filters || {{}})) {{
     const task = filterTasks.find((item) => item.rawKey === key);
+    if (isFirstDegreeKey(key)) continue;
     if (isAgeFilterKey(key)) {{
       const result = await applyAgeFilter(value);
       specialFilters[key] = result;
@@ -5979,6 +6114,7 @@ def build_apply_recommend_filters_expression(
     }}
   }}
   const strictReady = !strictRun || filterEntries.every(([key,value]) =>
+    isFirstDegreeKey(key)?true:
     strictKeys.has(key)?splitFilterValues(value).every(item =>
       (specialFilters[key]?.selectedBeforeConfirm || []).some(selected=>sameOption(selected,item))):
       valueVerified(key, value, specialFilters[key], echoBeforeConfirm));
@@ -5989,6 +6125,15 @@ def build_apply_recommend_filters_expression(
   if (confirmButton) {{
     clickElement(confirmButton);
     await delay(actionDelayMs || 1000);
+  }}
+  if (Object.prototype.hasOwnProperty.call(filters || {{}}, '只看第一学历')) {{
+    const firstDegree = await applyFirstDegreeFilter();
+    specialFilters['只看第一学历'] = firstDegree;
+    (firstDegree.checked ? appliedFilters : missingFilters).push('只看第一学历');
+  }} else {{
+    // 未勾选时必须显式取消，否则 BOSS 会沿用上一次的勾选状态
+    const cleared = await clearFirstDegreeFilter();
+    if (cleared.cleared) specialFilters['只看第一学历'] = cleared;
   }}
   let exactConfirmed = false;
   if (autoConfirm && strictReady && rootDocument.querySelector('.filter-panel')) {{
@@ -6022,6 +6167,25 @@ def build_apply_recommend_filters_expression(
   const unverifiedFilters = [];
   for (const [key, value] of Object.entries(filters || {{}})) {{
     const result = specialFilters[key];
+    if (isFirstDegreeKey(key)) {{
+      const checked = Boolean(result?.checked);
+      const firstDegreeTask = filterTasks.find((item) => item.rawKey === key);
+      if (firstDegreeTask) {{
+        firstDegreeTask.controlType = 'checkbox';
+        firstDegreeTask.status = checked ? 'verified' : 'missing';
+        firstDegreeTask.verified = checked;
+        firstDegreeTask.evidence = checked ? ['first_degree_checked'] : [];
+      }}
+      if (checked) verifiedAppliedFilters.push(key);
+      verification[key] = {{
+        applied: checked, verified: checked, expected: value, expectedValues: [value],
+        verifiedValues: checked ? [value] : [], missingValues: checked ? [] : [value],
+        actual: [], selectedAfterClick: [], selectedBeforeConfirm: [], selectedAfterConfirm: [],
+        selectedSnapshots: [], evidence: checked ? ['first_degree_checked'] : [],
+        similarGroups: [], controlType: 'checkbox'
+      }};
+      continue;
+    }}
     const verifiedBeforeConfirm = valueVerified(key, value, result, echoBeforeConfirm);
     const verifiedAfterConfirm = valueVerified(key, value, result, echoAfterConfirm);
     const verified = strictRun

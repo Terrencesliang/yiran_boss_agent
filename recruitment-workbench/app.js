@@ -5,7 +5,7 @@ const statusText = {PASS:"符合", FAIL:"不符合", UNKNOWN:"不符合", CAPTUR
 const fields = {education_level:"学历", education_mode:"学习形式", graduation_year:"毕业届别",
   graduate_status:"应届身份", major:"专业", major_group:"专业类", hr_experience_months:"人力经历（月）",
   hands_on_tools:"实操工具", OR:"满足任一专业条件", AND:"全部满足"};
-const state = {autoGreet:true, page:"tasks", reports:[], report:0, catalog:null, status:"", query:"", discipline:"",
+const state = {autoGreet:true, bossFilterOpen:false, page:"tasks", reports:[], report:0, catalog:null, status:"", query:"", discipline:"",
   catalogPage:0, request:"",
   job:"", plan:null, message:""};
 
@@ -83,7 +83,8 @@ function condition(item) {
 function planResult() {
   const output=state.plan;
   if(output?.pending) return '<p class="loading-text" role="status">正在解析招聘要求…</p>';
-  if(output?.error) return '<div class="notice danger" role="alert"><strong>解析失败</strong><p>'+escape(output.error)+'</p></div>';
+  if(output?.error) return '<div class="notice danger" role="alert"><strong>解析失败</strong><p>'+escape(output.error)+'</p>'+
+    (/模型解析未通过/.test(output.error)?'<button type="button" class="button" data-force-rule>改用规则解析继续</button>':"")+'</div>';
   if(!output?.task) return "";
   const t=output.task;
   const metadata=output.parsing_metadata;
@@ -122,7 +123,8 @@ function planResult() {
       '<p><button class="button" type="button" data-replace-request="'+escape(text)+'" data-replacement="'+
       escape(replacement)+'">'+label+'</button> '+escape(replacement)+'</p>').join("")+'</div>').join("");
   const renderList=items=>items.length?'<ul>'+items.map(x=>"<li>"+escape(x)+"</li>").join("")+"</ul>":'<p class="subtitle">无</p>';
-  const modeNotice=mode?'<p class="subtitle">'+escape(mode)+
+  const modeLabel={ai:"模型解析",rule:"本地规则解析",human_override:"人工修订"}[mode] || mode;
+  const modeNotice=mode?'<p class="subtitle">'+escape(modeLabel)+
     (metadata.fallback_reason?' · '+escape(fallbackLabels[metadata.fallback_reason] || "AI 解析未通过校验"):'')+'</p>':'';
   const snapshot=output.snapshot;
   const expired=snapshot && snapshot.expires_at*1000<=Date.now();
@@ -156,14 +158,19 @@ function planResult() {
       (quotes.length?'<details><summary>原文依据</summary>'+renderList(quotes)+'</details>':'')+'</li>';
   }).join("")+'</ul>':'<p class="subtitle">暂无</p>';
   return '<section class="condition-summary"><div class="section-heading"><div><h2>确认筛选条件</h2>'+modeNotice+
-    '<p class="subtitle">'+t.hard_filters.length+' 项硬性要求 · '+t.soft_preferences.length+' 项优先条件</p>'+
+    '<p class="subtitle">'+t.hard_filters.length+' 项核心要求 · '+t.soft_preferences.length+' 项加分项 · 判定：'+
+      escape(policyLabel({decision_mode:t.decision_mode,min_core_percent:t.min_core_percent,min_bonus_count:t.min_bonus_count}))+'</p>'+
     '</div><span class="pill '+(pendingList.length?"UNKNOWN":"PASS")+'">'+(pendingList.length?"需要补充信息":"解析完成")+'</span></div>'+
     (Object.keys(t.boss_page_filters || {}).length?'<div class="plan-filter-row"><span>BOSS 页面筛选</span>'+
       Object.entries(t.boss_page_filters).map(([key,value])=>'<b>'+escape(key+" "+value)+'</b>').join("")+'</div>':"")+
     '<div class="requirements-grid'+(t.hard_filters.length && t.soft_preferences.length?"":" is-single")+'">'+
-    (t.hard_filters.length?'<div><h3>硬性要求</h3>'+criteria(t.hard_filters,"hard")+'</div>':"")+
-    (t.soft_preferences.length?'<div><h3>优先条件 <span class="muted">需同时满足</span></h3>'+criteria(t.soft_preferences,"preference")+'</div>':"")+
+    (t.hard_filters.length?'<div><h3>核心要求</h3>'+criteria(t.hard_filters,"hard")+'</div>':"")+
+    (t.soft_preferences.length?'<div><h3>加分项</h3>'+criteria(t.soft_preferences,"preference")+'</div>':"")+
     '</div>'+
+    ((t.reference_conditions || []).length?'<div class="notice"><strong>以下条件暂未自动识别，未参与判定</strong>'+
+      renderList(t.reference_conditions)+'<p>建议改写成可核对的条件，例如「1 年以上电商行业经验」「做过 RAG 项目」。</p>'+
+      '<button type="button" class="button" data-rewrite-refs>自动改写这些条件</button></div>':'')+
+    (state.rewriteNote?'<p class="muted rewrite-note">'+escape(state.rewriteNote)+'</p>':'')+
     (pendingList.length?'<div class="notice"><strong>暂时无法进入运行预览</strong>'+renderList(pendingList)+
       (examples || '<p>请把需要补充的条件写具体，并标明是必须满足还是优先考虑。</p>')+
       '<button type="button" class="button" data-edit-request="1">返回修改招聘要求</button></div>':'')+
@@ -191,18 +198,56 @@ function bossPageFilterEditor() {
   const majorEditor=majorGroups.length?'<details class="boss-major-editor"><summary>专业 · <span id="boss-major-count">'+
     (selectedMajors.length?"已选 "+selectedMajors.length+" / 5":"不限")+'</span></summary>'+
     '<p>最多选 5 项。若选项还未出现在 BOSS 快捷列表，筛选时会更新当前岗位的专业快捷项。</p><p id="boss-major-selection" role="status">'+
-    escape(selectedMajors.join("、"))+'</p>'+majorGroups.map(([group,names])=>
+    escape(selectedMajors.join("、"))+'</p>'+
+    '<label class="boss-major-search">搜索专业 <input id="boss-major-search" type="search" autocomplete="off" placeholder="输入专业名称，如 计算机、心理"></label>'+
+    majorGroups.map(([group,names])=>
       '<details><summary>'+escape(group)+'</summary><div class="boss-major-options">'+names.map(name=>
         '<label><input type="checkbox" data-boss-major value="'+escape(name)+'"'+
         (selectedMajors.includes(name)?' checked':'')+'>'+escape(name)+'</label>').join("")+'</div></details>').join("")+'</details>':"";
-  return '<details class="task-example"'+(Object.keys(state.bossPageFilters).length?' open':'')+
+  return '<details class="task-example boss-page-filters"'+
+    (state.bossFilterOpen || Object.keys(state.bossPageFilters).length?' open':'')+
     '><summary>BOSS 页面筛选</summary><p>选项需要 BOSS 账号具备相应权限。开始筛选前会核验所选条件。</p>'+
-    '<div class="requirements-grid">'+options.filter(([key])=>key!=="专业" || !majorEditor).map(([key,values])=>'<label>'+escape(key)+
+    '<div class="requirements-grid">'+options.filter(([key])=>(key!=="专业" || !majorEditor) && key!=="只看第一学历").map(([key,values])=>'<label>'+escape(key)+
       (key==="年龄"?'<input data-boss-page-filter="年龄" type="text" maxlength="5" pattern="[0-9]{2}-[0-9]{2}" '+
         'placeholder="不限，例如 25-35" value="'+escape(state.bossPageFilters[key] || "")+'"></label>':
       '<select data-boss-page-filter="'+escape(key)+'"><option value="">不限</option>'+
       values.map(value=>'<option value="'+escape(value)+'"'+(state.bossPageFilters[key]===value?' selected':'')+'>'+
-        escape(value)+'</option>').join("")+'</select></label>')).join("")+'</div>'+majorEditor+'</details>';
+        escape(value)+'</option>').join("")+'</select></label>')).join("")+'</div>'+
+    '<label class="check boss-first-degree"'+(state.bossPageFilters["院校"]==="公办本科"?"":" hidden")+'>'+
+    '<input type="checkbox" data-boss-first-degree '+(state.bossPageFilters["只看第一学历"]==="是"?"checked":"")+
+    '><span>只看第一学历（第一学历为全日制本科）</span></label>'+majorEditor+'</details>';
+}
+function policyLabel(policy) {
+  const mode=policy?.decision_mode || "strict_all";
+  if(mode==="strict_core")return "核心要求全部满足就判为符合";
+  if(mode==="weighted")return "核心满足 "+(policy.min_core_percent ?? 60)+"%、加分项 "+(policy.min_bonus_count ?? 1)+" 项即可";
+  return "所有条件都满足才判为符合";
+}
+function policyHint(mode) {
+  if(mode==="strict_core")return "核心要求全部满足就通过；加分项只影响排序，不卡通过。";
+  if(mode==="weighted")return "核心要求可以差一点，用加分项补：达到下面的门槛就通过。";
+  return "核心和加分项都要满足，最严格。";
+}
+function jobPolicyPanel() {
+  if(typeof workspace==="undefined" || !state.job)return "";
+  const policy=(workspace.job_policies || {})[state.job] || {decision_mode:"strict_all",min_core_percent:100,min_bonus_count:0};
+  const mode=policy.decision_mode || "strict_all";
+  const core=policy.min_core_percent ?? 100;
+  const bonus=policy.min_bonus_count ?? 0;
+  return '<details class="job-policy" id="job-policy"><summary>判定规则：'+escape(policyLabel(policy))+'</summary>'+
+    '<div class="policy-body">'+
+      '<label class="policy-mode">哪些人算符合？<select id="policy-mode">'+
+        [["strict_core","核心要求全部满足（推荐）"],["strict_all","所有条件都满足（最严）"],["weighted","核心差一点，加分项补足"]]
+          .map(([value,text])=>'<option value="'+value+'"'+(mode===value?' selected':'')+'>'+escape(text)+'</option>').join("")+
+      '</select></label>'+
+      '<p class="policy-hint" id="policy-hint">'+escape(policyHint(mode))+'</p>'+
+      '<div class="policy-weighted"'+(mode==="weighted"?"":" hidden")+' id="policy-weighted">'+
+        '<label>核心至少满足 <input id="min-core" type="number" min="0" max="100" value="'+escape(core)+'"> %</label>'+
+        '<label>加分项至少 <input id="min-bonus" type="number" min="0" max="20" value="'+escape(bonus)+'"> 项</label>'+
+      '</div>'+
+      '<div class="policy-actions"><button type="button" class="button is-primary" data-save-policy>保存规则</button>'+
+      '<span id="policy-status" role="status"></span></div>'+
+    '</div></details>';
 }
 function tasks() {
   const jobs=typeof workspace==="undefined"?[]:workspace.job_records;
@@ -219,9 +264,14 @@ function tasks() {
     '<section class="panel task-panel"><div class="panel-top"><div><h2>填写招聘需求</h2><p id="task-sync" role="status">'+escape(sync)+
     '</p></div><button type="button" class="button" data-sync-task>同步岗位</button></div>'+
     '<form class="form" id="plan"><label>招聘岗位<select id="job" required><option value="">请先选择岗位</option>'+
-    options+'</select></label>'+(jobs.length?'':'<p class="notice">暂无岗位。请先点击「同步岗位」。</p>')+
-    '<label>招聘要求<textarea id="request" rows="5" required placeholder="写下学历、专业、经历等要求">'+escape(state.request)+
-    '</textarea></label><details class="task-example"><summary>查看填写示例</summary><p>'+escape(example)+'</p>'+
+    options+'</select></label><div id="job-policy-slot">'+jobPolicyPanel()+'</div>'+(jobs.length?'':'<p class="notice">暂无岗位。请先点击「同步岗位」。</p>')+
+    '<label>核心要求（每行一条，必须满足）<textarea id="core-lines" rows="3" placeholder="例如：本科及以上\n1 年以上电商行业经验">'+
+      escape(state.coreLines)+'</textarea></label>'+
+    '<label>加分项（每行一条，优先考虑）<textarea id="bonus-lines" rows="2" placeholder="例如：会 WorkBuddy 或 Agent\n做过 RAG 项目">'+
+      escape(state.bonusLines)+'</textarea></label>'+
+    '<input type="hidden" id="request" value="'+escape(state.request)+'">'+
+    '<p class="muted">逐条填写会分别标注「必须满足 / 优先考虑」；暂时无法识别的条件会列在下方参考条件里，不会卡住流程。</p>'+
+    '<details class="task-example"><summary>查看填写示例</summary><p>'+escape(example)+'</p>'+
     '<button type="button" class="button" data-use-example>使用示例</button></details>'+
     bossPageFilterEditor()+
     (typeof workspace!=="undefined" && workspace.mode!=="mock"
@@ -306,7 +356,7 @@ document.addEventListener("click", event=>{
   if(button.dataset.id) details(button.dataset.id);
   if(button.dataset.turn) {state.catalogPage+=Number(button.dataset.turn);listCatalog();}
   if(button.dataset.confirmPlan) changeSnapshot("confirm");
-  if(button.dataset.editRequest) $("#request")?.focus();
+  if(button.dataset.editRequest) ($("#core-lines") || $("#request"))?.focus();
   if(button.dataset.replaceRequest) {
     const input=$("#request");
     const before=button.dataset.replaceRequest;
@@ -321,7 +371,11 @@ document.addEventListener("click", event=>{
   if(button.dataset.editPlan && !state.plan?.changing && typeof beginConditionEdit==="function") {beginConditionEdit();updatePlanResult();}
   if(Object.hasOwn(button.dataset,"useExample")) {
     state.request=workspace.example_request || "本科及以上，计算机类专业，人力资源经验不超过一年";
+    state.coreLines="";
+    state.bonusLines="";
     $("#request").value=state.request;
+    if($("#core-lines"))$("#core-lines").value="";
+    if($("#bonus-lines"))$("#bonus-lines").value="";
     scheduleTaskParse(true);
     (state.job?$("#request"):$("#job")).focus();
   }
@@ -338,6 +392,8 @@ content.addEventListener("input",event=>{
   if(typeof syncEditor==="function")syncEditor(event);
   if(event.target.id==="request") {
     state.request=event.target.value;
+    state.rewriteCount=0;
+    state.rewriteNote="";
     scheduleTaskParse(!event.isComposing);
   }
 });
@@ -367,10 +423,28 @@ content.addEventListener("change",event=>{
   if(bossFilter) {
     if(event.target.value)state.bossPageFilters[bossFilter]=event.target.value;
     else delete state.bossPageFilters[bossFilter];
+    if(bossFilter==="院校") {
+      const row=document.querySelector(".boss-first-degree");
+      const eligible=event.target.value==="公办本科";
+      if(row)row.hidden=!eligible;
+      const panel=document.querySelector(".boss-page-filters");
+      if(panel)panel.open=true;
+      state.bossFilterOpen=true;
+      if(!eligible)delete state.bossPageFilters["只看第一学历"];
+      const box=document.querySelector("[data-boss-first-degree]");
+      if(box && !eligible)box.checked=false;
+    }
     scheduleTaskParse(event.target.reportValidity());
+  }
+  if(event.target.hasAttribute("data-boss-first-degree")) {
+    if(event.target.checked)state.bossPageFilters["只看第一学历"]="是";
+    else delete state.bossPageFilters["只看第一学历"];
+    scheduleTaskParse(true);
   }
   if(event.target.id==="job") {
     state.job=event.target.value;
+    const slot=document.querySelector("#job-policy-slot");
+    if(slot)slot.innerHTML=jobPolicyPanel();
     scheduleTaskParse(true);
   }
 });
@@ -384,21 +458,28 @@ let parseVersion=Number.isSafeInteger(restoredTask.version) && restoredTask.vers
 const parseTab=/^[a-f0-9]{32}$/.test(restoredTask.tab || "")?restoredTask.tab:crypto.randomUUID().replaceAll("-","");
 state.job=typeof restoredTask.job==="string"?restoredTask.job:"";
 state.request=typeof restoredTask.request==="string"?restoredTask.request:"";
+state.coreLines=typeof restoredTask.coreLines==="string"?restoredTask.coreLines:"";
+state.bonusLines=typeof restoredTask.bonusLines==="string"?restoredTask.bonusLines:"";
 state.previewRun=typeof restoredTask.run==="string"?restoredTask.run:"";
 try{const savedAuto=sessionStorage.getItem("workbench-auto-greet");if(savedAuto!==null)state.autoGreet=savedAuto==="1";}catch{}
 state.bossPageFilters=restoredTask.bossPageFilters && typeof restoredTask.bossPageFilters==="object"?restoredTask.bossPageFilters:{};
 let parseController;
 const planHeaders={"Content-Type":"application/json","X-Workbench":"local-ui"};
+function combinedRequest() {
+  const lines=(text,prefix)=>String(text || "").split("\n").map(item=>item.trim()).filter(Boolean).map(item=>prefix+item);
+  return [state.request.trim(), ...lines(state.coreLines,""), ...lines(state.bonusLines,"优先考虑：")]
+    .filter(Boolean).join("\n");
+}
 function persistTask() {
   try {sessionStorage.setItem(taskStorageKey,JSON.stringify({tab:parseTab,version:parseVersion,job:state.job,
-    request:state.request,run:state.previewRun,snapshot:state.plan?.snapshot?.plan_id,bossPageFilters:state.bossPageFilters}));} catch {}
+    request:state.request,coreLines:state.coreLines,bonusLines:state.bonusLines,run:state.previewRun,snapshot:state.plan?.snapshot?.plan_id,bossPageFilters:state.bossPageFilters}));} catch {}
 }
 async function restoreSnapshot() {
   if(!/^[a-f0-9]{32}$/.test(restoredTask.snapshot || ""))return;
   const version=parseVersion;
   try {
     const saved=await api("/api/plans/"+restoredTask.snapshot);
-    if(version!==parseVersion || saved.job_id!==state.job || saved.source_text!==state.request)return;
+    if(version!==parseVersion || saved.job_id!==state.job || saved.source_text!==combinedRequest())return;
     state.plan=saved;
   } catch(error) {
     if(version!==parseVersion)return;
@@ -426,16 +507,57 @@ function scheduleTaskParse(ready) {
   state.plan=null;
   state.previewRun="";
   state.editPlan=false;
+  state.forceRule=false;
   if(invalidate) api("/api/plans/invalidate",{method:"POST",headers:planHeaders,
     body:JSON.stringify({tab:parseTab,generation:parseVersion})}).catch(()=>{});
   updatePlanResult();
   if($("#task-run"))$("#task-run").innerHTML="";
   persistTask();
-  if(ready && state.job && state.request.trim()) parseTimer=setTimeout(parseTask,650);
+  if(ready && state.job && combinedRequest().trim()) parseTimer=setTimeout(parseTask,650);
+}
+async function runRewrite(lines, auto) {
+  const items=(lines || []).filter(Boolean);
+  if(!items.length) return;
+  if(auto && (state.rewriteCount || 0)>=1) return;
+  state.rewriteCount=(state.rewriteCount || 0)+1;
+  try {
+    const data=await post("/api/rewrite",{lines:items});
+    const applied=[];
+    for(const item of data?.rewrites || []) {
+      const original=item.original, rewritten=item.rewritten;
+      if(!original || !rewritten || rewritten===original) continue;
+      let hit=false;
+      for(const key of ["coreLines","bonusLines","request"]) {
+        if(typeof state[key]==="string" && state[key].includes(original)) {
+          state[key]=state[key].replace(original,rewritten);
+          hit=true;
+        }
+      }
+      if(hit) applied.push(original+" → "+rewritten);
+    }
+    if(!applied.length) {
+      state.rewriteNote="自动改写未生效：这些条件已经足够具体，或模型没能给出更好的写法。";
+      updatePlanResult();
+      return;
+    }
+    if($("#core-lines"))$("#core-lines").value=state.coreLines;
+    if($("#bonus-lines"))$("#bonus-lines").value=state.bonusLines;
+    if($("#request"))$("#request").value=state.request;
+    state.rewriteNote="已自动改写 "+applied.length+" 条："+applied.join("；");
+    persistTask();
+    scheduleTaskParse(true);
+  } catch(error) {
+    state.rewriteNote="自动改写失败："+error.message;
+    updatePlanResult();
+  }
+}
+function maybeAutoRewrite(result) {
+  const refs=(result?.task?.reference_conditions || []).filter(Boolean);
+  if(refs.length) runRewrite(refs, true);
 }
 async function parseTask() {
   clearTimeout(parseTimer);
-  const {request,job}=state;
+  const job=state.job, request=combinedRequest();
   const activeRun=state.previewRun && typeof workspace!=="undefined" &&
     workspace.runs.find(run=>run.id===state.previewRun);
   if(!job || !request.trim() || state.plan?.pending || state.previewSubmitting ||
@@ -449,11 +571,14 @@ async function parseTask() {
   updatePlanResult();
   let result;
   try{result=await api("/api/plan",{method:"POST",headers:planHeaders,
-    body:JSON.stringify({request,job_id:job,tab:parseTab,generation:version,boss_page_filters:state.bossPageFilters,auto_greet:state.autoGreet!==false}),signal:parseController?.signal});}
+    body:JSON.stringify({request,job_id:job,tab:parseTab,generation:version,boss_page_filters:state.bossPageFilters,auto_greet:state.autoGreet!==false,force_rule:state.forceRule===true,
+    core_lines:String(state.coreLines||"").split("\n").map(item=>item.trim()).filter(Boolean),
+    bonus_lines:String(state.bonusLines||"").split("\n").map(item=>item.trim()).filter(Boolean)}),signal:parseController?.signal});}
   catch(error){result={error:error.message};}
-  if(version!==parseVersion || state.job!==job || state.request!==request)return;
+  if(version!==parseVersion || state.job!==job || combinedRequest()!==request)return;
   state.plan=result;
   if(result.snapshot) state.previewRun="";
+  maybeAutoRewrite(result);
   persistTask();
   updatePlanResult();
   if(typeof updateTaskStatus==="function")updateTaskStatus();
@@ -517,4 +642,80 @@ Promise.allSettled([api("/api/reports"),api("/api/catalog")]).then(([reports,cat
   else state.message=reports.reason.message;
   if(catalogData.status==="fulfilled")state.catalog=catalogData.value;
   render();
+});
+
+content.addEventListener("input",event=>{
+  if(event.target.id!=="boss-major-search")return;
+  const keyword=event.target.value.trim().toLowerCase();
+  document.querySelectorAll(".boss-major-options label").forEach(label=>{
+    label.hidden=Boolean(keyword) && !(label.textContent || "").toLowerCase().includes(keyword);
+  });
+  document.querySelectorAll(".boss-major-editor details").forEach(group=>{
+    if(group.classList.contains("boss-major-editor"))return;
+    const visible=[...group.querySelectorAll(".boss-major-options label")].some(label=>!label.hidden);
+    group.hidden=!visible;
+    if(keyword && visible)group.open=true;
+  });
+});
+
+content.addEventListener("toggle",event=>{
+  if(event.target.classList?.contains("boss-page-filters")) state.bossFilterOpen=event.target.open;
+},true);
+
+content.addEventListener("click",async event=>{
+  const button=event.target.closest("[data-save-policy]");
+  if(!button)return;
+  if(!state.job){state.message="请先选择岗位";render();return;}
+  const mode=document.querySelector("#policy-mode")?.value || "strict_all";
+  const body={job_id:state.job, decision_mode:mode,
+    min_core_percent:Number(document.querySelector("#min-core")?.value ?? 100) || 0,
+    min_bonus_count:Number(document.querySelector("#min-bonus")?.value ?? 0) || 0};
+  button.disabled=true;
+  try {
+    await post("/api/job-policy",body);
+    await refreshWorkspace(true);
+    const status=document.querySelector("#policy-status");
+    if(status)status.textContent="已保存，正在按新规则重新解析";
+    scheduleTaskParse(true);
+  } catch(error) {
+    state.message=error.message;
+    render();
+  } finally {
+    button.disabled=false;
+  }
+});
+
+content.addEventListener("input",event=>{
+  if(event.target.id!=="core-lines" && event.target.id!=="bonus-lines")return;
+  if(event.target.id==="core-lines")state.coreLines=event.target.value;
+  else state.bonusLines=event.target.value;
+  state.rewriteCount=0;
+  persistTask();
+  scheduleTaskParse(!event.isComposing);
+});
+
+content.addEventListener("change",event=>{
+  if(event.target.id!=="policy-mode")return;
+  const mode=event.target.value;
+  const hint=document.querySelector("#policy-hint");
+  if(hint)hint.textContent=policyHint(mode);
+  const row=document.querySelector("#policy-weighted");
+  if(row)row.hidden=mode!=="weighted";
+  if(mode==="weighted") {
+    const core=document.querySelector("#min-core"), bonus=document.querySelector("#min-bonus");
+    if(core && Number(core.value)===100)core.value="60";
+    if(bonus && Number(bonus.value)===0)bonus.value="1";
+  }
+});
+
+content.addEventListener("click",event=>{
+  if(event.target.closest("[data-rewrite-refs]")) {
+    state.rewriteCount=0;
+    state.rewriteNote="";
+    runRewrite(state.plan?.task?.reference_conditions || [], false);
+    return;
+  }
+  if(!event.target.closest("[data-force-rule]"))return;
+  state.forceRule=true;
+  parseTask();
 });

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from functools import partial
 import json
 import os
+import re
 from pathlib import Path
 from threading import RLock, Thread
 import time
@@ -22,6 +23,7 @@ from boss_agent.recommend_preview import load_preview_task, run_recommend_previe
 from boss_agent.resume_agent import _request_json_completion
 from boss_agent.scoring import score_conversation
 from boss_agent.task_parser import parse_recruitment_task
+from boss_agent.task_schema import Criterion
 from boss_agent.task_snapshot import TaskSnapshots, digest
 from reviews import ReviewStore
 
@@ -70,6 +72,7 @@ class Workbench:
         self.reviews = ReviewStore(self)
         self.state = (json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists()
                       else {"jobs": [], "runs": [], "scheduler": False, "dispositions": {}})
+        self.state.setdefault("job_policies", {})
         if "published_jobs" not in self.state:
             self.state["published_jobs"] = next(
                 (run.get("result", {}).get("job_names", []) for run in reversed(self.state["runs"])
@@ -111,6 +114,7 @@ class Workbench:
                              for run in reversed(self.state["runs"][-60:])
                              if not run.get("_snapshot_execution") or run["_snapshot_execution"]["owner"] == owner],
                     "scheduler": self.state["scheduler"], "dispositions": dict(self.state["dispositions"]),
+                    "job_policies": dict(self.state["job_policies"]),
                     "mode": "mock" if self.mock_dir else "live", "endpoint": self.endpoint,
                     "demo": self.demo, "example_request": DEMO_REQUEST if self.demo else None,
                     "configured_parser": ("ai" if not self.demo and os.environ.get("BOSS_TASK_AI_ENABLED", "").lower().strip()
@@ -118,6 +122,30 @@ class Workbench:
 
     def client(self):
         return ChromeDebugClient(self.endpoint, mock_dir=self.mock_dir)
+
+    def save_job_policy(self, payload):
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("请选择岗位后再设置判定规则")
+        mode = payload.get("decision_mode") or "strict_all"
+        if mode not in {"strict_all", "strict_core", "weighted"}:
+            raise ValueError("判定规则不支持")
+        min_core = payload.get("min_core_percent", 100)
+        min_bonus = payload.get("min_bonus_count", 0)
+        if type(min_core) is not int or not 0 <= min_core <= 100:
+            raise ValueError("核心要求最低满足比例需在 0–100 之间")
+        if type(min_bonus) is not int or not 0 <= min_bonus <= 20:
+            raise ValueError("加分项最低数量需在 0–20 之间")
+        with self.lock:
+            self.state["job_policies"][job_id] = {
+                "decision_mode": mode, "min_core_percent": min_core, "min_bonus_count": min_bonus,
+            }
+            self.persist()
+            return {"job_id": job_id, "policy": dict(self.state["job_policies"][job_id])}
+
+    def job_policy(self, job_id):
+        with self.lock:
+            return dict(self.state["job_policies"].get(str(job_id or ""), {}))
 
     def save_job(self, payload):
         name = str(payload.get("name", "")).strip()
@@ -141,6 +169,61 @@ class Workbench:
                 self.state["jobs"].append(job)
             self.persist()
             return job
+
+    def rewrite_requirements(self, payload):
+        """把口语化/无法结构化的条件改写成可核对的短句（失败时原样返回）。"""
+        lines = payload.get("lines") if isinstance(payload, dict) else None
+        lines = [str(item).strip() for item in (lines or []) if str(item).strip()][:8]
+        if not lines:
+            return {"rewrites": []}
+        original = [{"original": item, "rewritten": item} for item in lines]
+        model = os.environ.get("BOSS_AGENT_LLM_MODEL")
+        if not model:
+            return {"rewrites": original}
+        system = ("你是招聘条件改写助手。把每条口语化要求改写成可核对的短句，保留原意，"
+                  "不超过 20 个字，不要解释。只输出 JSON：{\"rewrites\":[{\"original\":\"原文\",\"rewritten\":\"改写\"}]}")
+        try:
+            raw = _request_json_completion(system, json.dumps({"lines": lines}, ensure_ascii=False),
+                                           model, timeout=12, disable_deepseek_thinking=True)
+            data = json.loads(raw)
+            mapping = {str(item.get("original", "")).strip(): str(item.get("rewritten", "")).strip()
+                       for item in data.get("rewrites", []) if isinstance(item, dict)}
+            return {"rewrites": [{"original": item, "rewritten": mapping.get(item) or item} for item in lines]}
+        except Exception:
+            return {"rewrites": original}
+
+    @staticmethod
+    def absorb_unresolved(task, bonus_lines=()):
+        """无法结构化的条件：加分项尽量转成关键词匹配，其余进「参考条件」，避免卡死。"""
+        unresolved = [item[len("unresolved_condition:"):].strip()
+                      .removeprefix("必须满足：").removeprefix("优先考虑：")
+                      for item in task.ambiguous_fields if item.startswith("unresolved_condition:")]
+        # 加分项里的 verify 条件没有判定依据时，退化为关键词匹配
+        kept_soft, verify_keywords = [], []
+        for condition in task.soft_preferences:
+            if isinstance(condition, Criterion) and condition.operator == "verify":
+                tokens = re.findall(r"[A-Za-z][A-Za-z0-9+.#_-]{1,}", str(condition.value))
+                if tokens:
+                    verify_keywords.append(Criterion("resume_keywords", "has_any",
+                                                     list(dict.fromkeys(tokens))[:5], condition.source))
+                    continue
+            kept_soft.append(condition)
+        if not unresolved and not verify_keywords:
+            return task
+        remaining = [item for item in task.ambiguous_fields if not item.startswith("unresolved_condition:")]
+        bonus = [str(line).strip() for line in bonus_lines if str(line).strip()]
+        keywords_conditions, pending = [], []
+        for item in [value for value in unresolved if value]:
+            matched = next((line for line in bonus if line in item or item in line), None)
+            keywords = re.findall(r"[A-Za-z][A-Za-z0-9+.#_-]{1,}", matched or item)
+            if matched and keywords:
+                keywords_conditions.append(Criterion("resume_keywords", "has_any",
+                                                     list(dict.fromkeys(keywords))[:5], matched))
+            else:
+                pending.append(item)
+        return replace(task, ambiguous_fields=remaining,
+                       soft_preferences=[*kept_soft, *verify_keywords, *keywords_conditions],
+                       reference_conditions=[*task.reference_conditions, *pending])
 
     def auto_greet_task(self, task, enabled):
         """工作台开关视为“联系符合者”的明确意图，补足发起联系所需的任务字段。"""
@@ -575,14 +658,14 @@ class Workbench:
             return {"simulated":True,"task":parse_recruitment_task(payload.get("request") or "本科").to_dict()}
         load_local_llm_env(self.agent_root/".env", override=True)
         if not (os.environ.get("BOSS_AGENT_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")):
-            raise ValueError("未配置模型 API 密钥，请检查 .env。")
+            raise ValueError("未配置模型 API 密钥，请检查 boss-agent/.env。")
         model = os.environ.get("BOSS_AGENT_LLM_MODEL") or "gpt-4.1-mini"
         if action == "model-test":
             try:
                 _request_json_completion("只返回 JSON 对象。", '{"status":"ok"}', model)
             except HTTPError as error:
                 if error.code == 401:
-                    raise ValueError("模型服务拒绝认证（HTTP 401）。请检查 .env 中的服务地址和 API 密钥是否匹配。") from error
+                    raise ValueError("模型服务拒绝认证（HTTP 401）。请检查 boss-agent/.env 中的服务地址和 API 密钥是否匹配。") from error
                 raise
             return {"connected":True,"model":model}
         request = str(payload.get("request","")).strip()

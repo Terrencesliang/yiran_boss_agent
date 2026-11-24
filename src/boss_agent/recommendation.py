@@ -279,6 +279,25 @@ def _finding_has_source_support(finding, sources: dict[str, str]) -> bool:
     )
 
 
+def decide_verdict(mode: str, core_pass: int, core_unknown: int, core_total: int,
+                   bonus_pass: int, bonus_unknown: int, bonus_total: int,
+                   min_core: int, min_bonus: int) -> str:
+    """按岗位规则给出三态结论；strict_all 由调用方用 combine_status 处理。"""
+    if mode == "strict_core":
+        if core_total == 0:
+            return "PASS" if bonus_pass >= min_bonus else ("UNKNOWN" if bonus_unknown else "FAIL")
+        if core_pass == core_total:
+            return "PASS"
+        return "UNKNOWN" if core_unknown else "FAIL"
+    if mode == "weighted":
+        enough_core = core_total == 0 or core_pass * 100 >= min_core * core_total
+        enough_bonus = bonus_pass >= min_bonus
+        possible = ((core_total == 0 or (core_pass + core_unknown) * 100 >= min_core * core_total)
+                    and (bonus_pass + bonus_unknown) >= min_bonus)
+        return "PASS" if enough_core and enough_bonus else ("UNKNOWN" if possible else "FAIL")
+    return "UNKNOWN"
+
+
 def rank_recruitment_preview(
     task: RecruitmentTask,
     candidates: list[dict[str, Any]],
@@ -331,17 +350,33 @@ def rank_recruitment_preview(
         status = combine_status("AND", [finding.status for finding in findings])
         preferences = [evaluate_condition(rule, resume, judge, model_findings=model_findings)
                        for rule in task.soft_preferences]
+        mode = getattr(task, "decision_mode", "strict_all")
+        min_core = getattr(task, "min_core_percent", 100)
+        min_bonus = getattr(task, "min_bonus_count", 0)
+        core_pass = sum(1 for item in findings if item.status == "PASS")
+        core_unknown = sum(1 for item in findings if item.status == "UNKNOWN")
+        core_total = len(findings)
+        bonus_pass = sum(1 for item in preferences if item.status == "PASS")
+        bonus_unknown = sum(1 for item in preferences if item.status == "UNKNOWN")
+        bonus_total = len(preferences)
+        if mode == "strict_all":
+            verdict = combine_status("AND", [status, *[item.status for item in preferences]]) if preferences else status
+        else:
+            verdict = decide_verdict(mode, core_pass, core_unknown, core_total,
+                                     bonus_pass, bonus_unknown, bonus_total, min_core, min_bonus)
         conditions = [*findings, *preferences]
         matched = sum(1 for item in conditions if item.status == "PASS")
         total = len(conditions)
         match_percent = round(100 * matched / total) if total else 100
         supported = bool(findings) and all(_finding_has_source_support(item, sources) for item in findings)
-        unsupported_pass = status == "PASS" and bool(findings) and not supported
+        unsupported_pass = verdict == "PASS" and bool(findings) and not supported
         row = {"candidate_id": candidate_id, "hard_filter_status": status,
-               "eligibility_status": "UNKNOWN" if status == "PASS" and (capture_status == "partial" or unsupported_pass) else status,
-               "contact_evidence_verified": status == "PASS" and supported and capture_status != "partial",
+               "eligibility_status": "UNKNOWN" if verdict == "PASS" and (capture_status == "partial" or unsupported_pass) else verdict,
+               "contact_evidence_verified": verdict == "PASS" and supported and capture_status != "partial",
                "hard_filters": [finding.to_dict() for finding in findings],
                "match_percent": match_percent, "matched_conditions": matched, "total_conditions": total,
+               "decision_mode": mode, "core_pass": core_pass, "core_total": core_total,
+               "bonus_pass": bonus_pass, "bonus_total": bonus_total,
                "score": None, "score_breakdown": {}}
         if "capture_status" in candidate:
             row["capture_status"] = candidate["capture_status"]
@@ -353,9 +388,9 @@ def rank_recruitment_preview(
                     "finding": finding.to_dict(),
                     "points": round(100 * dimension.weight / total_weight, 2) if finding.status == "PASS" else 0,
                 }
-        if status == "FAIL":
+        if verdict == "FAIL":
             rejected.append(row)
-        elif status == "UNKNOWN" or capture_status == "partial" or unsupported_pass:
+        elif verdict == "UNKNOWN" or capture_status == "partial" or unsupported_pass:
             if candidate.get("capture_status") == "partial":
                 row["review_reason"] = "capture_incomplete"
             elif unsupported_pass:
@@ -380,7 +415,10 @@ def rank_recruitment_preview(
     qualified.sort(key=lambda row: (-row["score"], row["candidate_id"]))
     return {
         "task": task.to_dict(),
-        "strict_all_conditions": False,
+        "strict_all_conditions": task.decision_mode == "strict_all",
+        "decision_mode": task.decision_mode,
+        "min_core_percent": task.min_core_percent,
+        "min_bonus_count": task.min_bonus_count,
         "template": template,
         "execution_mode": "dry_run",
         "as_of": as_of.isoformat(),

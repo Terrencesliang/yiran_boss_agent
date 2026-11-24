@@ -16,7 +16,7 @@ from uuid import uuid4
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-AGENT = ROOT / "src"
+AGENT = ROOT / "boss-agent" / "src"
 sys.path.insert(0, str(AGENT))
 
 from boss_agent.semantic_task_parser import execution_matches, parse_task_with_metadata
@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         plan_action = re.fullmatch(r"/api/plans/([a-f0-9]{32})/(confirm|revise|revoke|resize)", self.path)
         cancel_run = re.fullmatch(r"/api/runs/([A-Za-z0-9_-]{1,64})/cancel", self.path)
         run, study = RUN_REVIEW.fullmatch(self.path), STUDY_REVIEW.fullmatch(self.path)
-        if not (plan_action or cancel_run or run or study) and self.path not in {"/api/plan","/api/jobs","/api/runs","/api/scheduler","/api/disposition","/api/plans/invalidate","/api/browser/connect"}:
+        if not (plan_action or cancel_run or run or study) and self.path not in {"/api/plan","/api/jobs","/api/runs","/api/scheduler","/api/disposition","/api/plans/invalidate","/api/browser/connect","/api/job-policy","/api/rewrite"}:
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -223,6 +223,12 @@ class Handler(BaseHTTPRequestHandler):
                 if cancel_run:
                     self.reply(workspace.cancel(cancel_run[1], owner=self.owner()))
                     return
+                if self.path == "/api/job-policy":
+                    self.reply(workspace.save_job_policy(payload))
+                    return
+                if self.path == "/api/rewrite":
+                    self.reply(workspace.rewrite_requirements(payload))
+                    return
                 if self.path == "/api/browser/connect":
                     self.reply(workspace.connect_browser())
                     return
@@ -248,22 +254,34 @@ class Handler(BaseHTTPRequestHandler):
             elif job not in workspace.overview()["published_jobs"]:
                 raise ValueError("请选择已同步的 BOSS 岗位。")
             model_only = getattr(self.server, "model_only", False)
-            if model_only:
+            if model_only and payload.get("force_rule") is True:
+                parsed = parse_task_with_metadata(text, enabled=False)
+            elif model_only:
                 parsed = parse_task_with_metadata(text, enabled=True, select=True)
             elif getattr(workspace, "demo", False):
                 parsed = parse_task_with_metadata(text, enabled=False)
             else:
                 parsed = parse_task_with_metadata(text)
             if model_only and parsed.metadata["mode"] != "ai":
-                self.reply({"error": "模型解析未通过（" + str(parsed.metadata.get("fallback_reason") or "未启用模型")
-                            + "）。请重试或检查模型配置。"}, 422)
-                return
+                if payload.get("force_rule") is not True:
+                    # 模型没通过（漏条件/超时等）自动退到规则解析，条件仍可逐条核对
+                    reason = str(parsed.metadata.get("fallback_reason") or "未启用模型")
+                    parsed = parse_task_with_metadata(text, enabled=False)
+                    parsed.metadata["fallback_reason"] = reason
             task = parsed.task
             if task.job and task.job != job:
                 raise ValueError("所选岗位与招聘指令中的岗位不一致。")
             task = replace(task, job=job, boss_page_filters=validate_boss_page_filters(payload.get("boss_page_filters", {})))
+            task = workspace.absorb_unresolved(task, payload.get("bonus_lines") or ())
             # 勾选“筛选后自动打招呼”时，按工作台开关补足联系意图与人数上限
             task = workspace.auto_greet_task(task, payload.get("auto_greet") is True)
+            # 按岗位配置的判定规则（核心全满足 / 核心达标+加分项补足）
+            job_key = payload.get("job_id") or (record.get("job_id") if record else "")
+            policy = workspace.job_policy(job_key)
+            if policy:
+                task = replace(task, decision_mode=policy["decision_mode"],
+                               min_core_percent=policy["min_core_percent"],
+                               min_bonus_count=policy["min_bonus_count"])
             task = load_preview_task(task.to_dict())
             plan = plan_recruitment_task(task, preview_only=True)
             result = {"task": task.to_dict(), "plan": plan, "parsing_metadata": parsed.metadata}
@@ -334,17 +352,18 @@ if __name__ == "__main__":
         parser.error("--review-study and --shadow-preview require --mock-dir")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.model_only = args.model_only
+    # 始终以本地 .env 为准：系统环境里可能有失效的旧密钥
+    load_local_llm_env(ROOT / "boss-agent" / ".env", override=True)
     if args.model_only:
-        load_local_llm_env(ROOT / ".env", override=True)
         os.environ["BOSS_TASK_AI_ENABLED"] = "1"
         os.environ.setdefault("BOSS_TASK_AI_TIMEOUT_SECONDS", "30")
     os.environ["NO_PROXY"] = ",".join(filter(None, [os.environ.get("NO_PROXY"), "127.0.0.1", "localhost"]))
-    server.workbench = Workbench(args.data_dir, ROOT,
+    server.workbench = Workbench(args.data_dir, ROOT / "boss-agent",
                                  f"http://127.0.0.1:{args.debug_port}", args.mock_dir,
                                  shadow_preview=args.shadow_preview or args.demo, demo=args.demo, model_only=args.model_only)
     if args.review_study:
         server.review_study = BlindStudy(server.workbench.reviews,
-                                         ROOT / "tests/fixtures/phase5_shadow_cases.json",
+                                         ROOT / "boss-agent/tests/fixtures/phase5_shadow_cases.json",
                                          ROOT / "phase5-evidence/synthetic-assessment.json",
                                          os.environ.get("BOSS_REVIEW_ADJUDICATION_KEY"))
     print(f"Local: http://127.0.0.1:{server.server_port}", flush=True)

@@ -16,7 +16,7 @@ from websocket import create_connection
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-sys.path[:0] = [str(HERE), str(ROOT / "src"), str(ROOT / "tests")]
+sys.path[:0] = [str(HERE), str(ROOT / "boss-agent/src"), str(ROOT / "boss-agent/tests")]
 
 from boss_agent.candidate_adapter import adapt_recommend_candidate
 from boss_agent.candidate_evidence import evidence_report
@@ -311,10 +311,10 @@ def main():
     with TemporaryDirectory(prefix="boss-review-browser-") as temporary:
         folder=Path(temporary)
         server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
-        server.workbench=Workbench(folder/"data",ROOT,"http://example.invalid",folder)
+        server.workbench=Workbench(folder/"data",ROOT/"boss-agent","http://example.invalid",folder)
         seed_run(server.workbench)
         rich_run(server.workbench)
-        server.review_study=BlindStudy(server.workbench.reviews,ROOT/"tests/fixtures/phase5_shadow_cases.json",
+        server.review_study=BlindStudy(server.workbench.reviews,ROOT/"boss-agent/tests/fixtures/phase5_shadow_cases.json",
                                       ROOT/"phase5-evidence/synthetic-assessment.json")
         thread=Thread(target=server.serve_forever)
         thread.start()

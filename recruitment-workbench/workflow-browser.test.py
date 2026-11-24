@@ -1,6 +1,7 @@
 """Exercise the product flow with Chromium and the real local demo APIs."""
 
 from importlib.util import module_from_spec, spec_from_file_location
+import io
 import json
 import os
 from pathlib import Path
@@ -64,13 +65,9 @@ def exercise(browser, url, desk):
     browser.until("document.querySelector('#job').options.length===3")
     browser.choose("#job", browser.js("document.querySelector('#job').options[1].value"))
     fill(browser, "#request", "本科及以上，背景合适")
-    browser.until("document.querySelector('#plan-result')?.innerText.includes('需要补充信息')")
-    assert not browser.js("Boolean(document.querySelector('[data-confirm-plan]'))")
-    fill(browser, "#request", "本科及以上，有agent经验")
-    browser.until("document.querySelector('[data-replacement=\"有 AI Agent 实操经验优先\"]')!==null")
-    browser.click('[data-replacement="有 AI Agent 实操经验优先"]')
-    assert browser.js("document.querySelector('#request').value") == "本科及以上，有 AI Agent 实操经验优先"
-    browser.until("state.plan?.task?.soft_preferences.some(item=>item.field==='hands_on_tools')")
+    browser.until("Boolean(state.plan?.task)")
+    assert browser.js("(state.plan.task.reference_conditions||[]).length>0")
+    assert browser.js("document.querySelector('#plan-result').innerText.includes('暂未自动识别')")
     browser.click(".task-example summary")
     browser.click("[data-use-example]")
     browser.until("document.querySelector('#plan-result')?.innerText.includes('模拟接口暂不可用')")
@@ -250,7 +247,7 @@ def main():
         raise SystemExit("Set PHASE6_CHROMIUM to a local Chromium executable")
     with TemporaryDirectory(prefix="workbench-product-browser-") as temp:
         root=Path(temp)
-        desk=PausedDemo(root/"data",harness.ROOT,"http://example.invalid",HERE/"demo-fixtures",demo=True,shadow_preview=True)
+        desk=PausedDemo(root/"data",harness.ROOT/"boss-agent","http://example.invalid",HERE/"demo-fixtures",demo=True,shadow_preview=True)
         server=harness.ThreadingHTTPServer(("127.0.0.1",0),DemoHandler)
         server.workbench=desk
         server.fail_next_parse=False
@@ -262,12 +259,20 @@ def main():
             # Fail only the sample's first parse after the genuine blocker case.
             original=DemoHandler.do_POST
             def intercept(handler):
-                if handler.path=="/api/plan" and not getattr(server,"saw_blocker",False):
-                    server.saw_blocker=True
-                    original(handler)
-                    server.fail_next_parse=True
-                else:
-                    original(handler)
+                if handler.path=="/api/plan" and not getattr(server,"saw_sample",False):
+                    length=int(handler.headers.get("Content-Length","0"))
+                    body=handler.rfile.read(length)
+                    handler.rfile=io.BytesIO(body)
+                    try:
+                        text=json.loads(body or b"{}").get("request","")
+                    except ValueError:
+                        text=""
+                    # 只让“使用示例”那一次解析失败，其他解析正常
+                    if text==DEMO_REQUEST:
+                        server.saw_sample=True
+                        handler.reply({"error": "模拟接口暂不可用，请重试。"}, 503)
+                        return
+                original(handler)
             DemoHandler.do_POST=intercept
             browser=harness.Chromium(binary,root/"profile",url)
             exercise(browser,url,desk)
